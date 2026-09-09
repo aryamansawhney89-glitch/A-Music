@@ -345,6 +345,19 @@ function handle(msg) {
       joinScreen.classList.remove('hidden');
       break;
     }
+
+    case 'reaction': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find((x) => x.id === msg.id);
+      if (m) {
+        m.reactions = msg.reactions || {};
+        if (state.active === msg.convoId) {
+          renderReactionsOnBubble(m);
+        }
+        renderChatList();
+      }
+      break;
+    }
   }
 }
 
@@ -684,8 +697,160 @@ function buildBubble(m, prev) {
     }
   }
 
-  row.appendChild(bubble);
+  // Wrapper to stack bubble + reactions vertically
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-wrap';
+  wrap.appendChild(bubble);
+
+  const reactionsEl = document.createElement('div');
+  reactionsEl.className = 'reactions-row';
+  wrap.appendChild(reactionsEl);
+  renderReactionsInEl(m, reactionsEl);
+
+  row.appendChild(wrap);
+  row.dataset.msgId = m.id;
+
+  // Long-press / right-click to open reaction picker
+  let pressTimer = null;
+  const openPicker = (e) => {
+    if (e) e.preventDefault();
+    openReactionPicker(m, reactionsEl);
+  };
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openPicker(e); });
+  row.addEventListener('pointerdown', () => {
+    pressTimer = setTimeout(openPicker, 500);
+  });
+  row.addEventListener('pointerup', () => clearTimeout(pressTimer));
+  row.addEventListener('pointerleave', () => clearTimeout(pressTimer));
+
   return row;
+}
+
+/* ---- reactions ---- */
+
+const QUICK_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
+
+function renderReactionsInEl(m, container) {
+  const reactions = m.reactions || {};
+  const keys = Object.keys(reactions).filter((k) => reactions[k] && reactions[k].length);
+  container.innerHTML = '';
+  for (const emoji of keys) {
+    const users = reactions[emoji];
+    const chip = document.createElement('button');
+    chip.className = 'reaction-chip';
+    if (users.includes(state.me)) chip.classList.add('mine');
+    chip.innerHTML = `<span class="reaction-emoji">${emoji}</span><span class="reaction-count">${users.length}</span>`;
+    chip.title = users.join(', ');
+    chip.addEventListener('click', () => {
+      const add = !users.includes(state.me);
+      wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add });
+    });
+    container.appendChild(chip);
+  }
+  // add "+" button to add more reactions
+  const addBtn = document.createElement('button');
+  addBtn.className = 'reaction-add';
+  addBtn.innerHTML = '+';
+  addBtn.title = 'Add reaction';
+  addBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openReactionPicker(m, container);
+  });
+  container.appendChild(addBtn);
+}
+
+function renderReactionsOnBubble(m) {
+  const row = messagesEl.querySelector(`[data-msg-id="${m.id}"]`);
+  if (!row) return;
+  const container = row.querySelector('.reactions-row');
+  if (container) renderReactionsInEl(m, container);
+}
+
+let reactionPickerEl = null;
+function openReactionPicker(m, anchorEl) {
+  closeReactionPicker();
+  const picker = document.createElement('div');
+  picker.className = 'reaction-picker';
+  picker.id = 'reactionPicker';
+  for (const emoji of QUICK_REACTIONS) {
+    const btn = document.createElement('button');
+    btn.className = 'reaction-pick';
+    btn.textContent = emoji;
+    btn.addEventListener('click', () => {
+      wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add: true });
+      closeReactionPicker();
+    });
+    picker.appendChild(btn);
+  }
+  // Add a "more" button that opens a larger grid
+  const moreBtn = document.createElement('button');
+  moreBtn.className = 'reaction-pick reaction-more-pick';
+  moreBtn.textContent = '⋯';
+  moreBtn.title = 'More reactions';
+  moreBtn.addEventListener('click', () => {
+    picker.innerHTML = '';
+    const ALL_REACTIONS = ['❤️','👍','😂','😮','😢','🙏','🔥','🎉','😍','👎','💯','🤣','😡','🥺','✨','👏','🤝','💪','🫶','💔'];
+    for (const emoji of ALL_REACTIONS) {
+      const btn = document.createElement('button');
+      btn.className = 'reaction-pick';
+      btn.textContent = emoji;
+      btn.addEventListener('click', () => {
+        wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add: true });
+        closeReactionPicker();
+      });
+      picker.appendChild(btn);
+    }
+    const backBtn = document.createElement('button');
+    backBtn.className = 'reaction-pick reaction-back';
+    backBtn.textContent = '←';
+    backBtn.addEventListener('click', () => {
+      picker.innerHTML = '';
+      for (const e of QUICK_REACTIONS) {
+        const b = document.createElement('button');
+        b.className = 'reaction-pick';
+        b.textContent = e;
+        b.addEventListener('click', () => {
+          wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji: e, add: true });
+          closeReactionPicker();
+        });
+        picker.appendChild(b);
+      }
+      const mb = document.createElement('button');
+      mb.className = 'reaction-pick reaction-more-pick';
+      mb.textContent = '⋯';
+      mb.addEventListener('click', moreBtn.click.bind(moreBtn));
+      picker.appendChild(mb);
+    });
+    picker.appendChild(backBtn);
+  });
+  picker.appendChild(moreBtn);
+
+  document.body.appendChild(picker);
+  reactionPickerEl = picker;
+
+  // Position near the message row
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.position = 'fixed';
+  picker.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  picker.style.left = Math.min(rect.left, window.innerWidth - 260) + 'px';
+
+  // Close on outside click
+  setTimeout(() => {
+    const closer = (e) => {
+      if (!picker.contains(e.target)) {
+        closeReactionPicker();
+        document.removeEventListener('pointerdown', closer);
+      }
+    };
+    document.addEventListener('pointerdown', closer);
+  }, 50);
+}
+
+function closeReactionPicker() {
+  if (reactionPickerEl && reactionPickerEl.parentNode) {
+    reactionPickerEl.parentNode.removeChild(reactionPickerEl);
+  }
+  reactionPickerEl = null;
 }
 
 function renderMessages(chat) {

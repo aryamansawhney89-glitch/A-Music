@@ -1,7 +1,7 @@
 {
   "name": "a-chat",
-  "version": "1.1.0",
-  "description": "A-Chat — a WhatsApp-style realtime chat web app with groups, photos, voice notes and profiles",
+  "version": "1.2.0",
+  "description": "A-Chat — a WhatsApp-style realtime chat web app with groups, photos, voice notes, reactions and profiles",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

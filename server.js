@@ -39,7 +39,7 @@ const BOTS = [
         'Hi {u}! Great to see you on A-Chat 💬',
       ] },
       { keys: ['help', 'feature', 'how'], replies: [
-        'Here is what A-Chat can do: realtime messaging, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: use the 👥 button in the sidebar to create a group!',
+        'Here is what A-Chat can do: realtime messaging, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, message reactions 😍, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: long-press any message to react to it!',
       ] },
       { keys: ['group', 'invite'], replies: [
         'Groups are here! 👥 Tap the 👥 button in the sidebar, pick a name, a picture (optional) and tick the members you want.',
@@ -212,6 +212,7 @@ function migrateMessage(m, convoId) {
     ts: m.ts || Date.now(),
     deliveredBy: Array.isArray(m.deliveredBy) ? m.deliveredBy : (m.delivered ? others : []),
     readBy: Array.isArray(m.readBy) ? m.readBy : (m.read ? others : []),
+    reactions: m.reactions && typeof m.reactions === 'object' ? m.reactions : {},
   };
 }
 
@@ -365,10 +366,62 @@ function sanitizeMedia(media, kind) {
 
 /* ---------------------------------- bots ---------------------------------- */
 
+const BOT_REACTIONS = {
+  'Aria': ['💚', '👍', '😊', '🙌'],
+  'Max': ['😂', '🔥', '💯', '😎', '🤣'],
+  'DJ Nova': ['🎵', '🎶', '🔥', '🎧', '💃'],
+};
+
+function botReactToMessage(convoId, fromName) {
+  // Bots may react with an emoji to human messages (30% chance in DMs, 15% in groups)
+  const isDM = convoId.startsWith('dm::');
+  if (Math.random() > (isDM ? 0.30 : 0.15)) return;
+  for (const p of convoParticipants(convoId)) {
+    if (p === fromName || !isBot(p)) continue;
+    const emojis = BOT_REACTIONS[p];
+    if (!emojis) continue;
+    const emoji = emojis[Math.floor(Math.random() * emojis.length)];
+    // find the last message from fromName in this convo
+    const msgs = conversations.get(convoId) || [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].from === fromName) {
+        handleReact(convoId, p, msgs[i].id, emoji, true, /*silent*/ true);
+        break;
+      }
+    }
+  }
+}
+
+function handleReact(convoId, reactor, messageId, emoji, add, silent) {
+  const msgs = conversations.get(convoId) || [];
+  const m = msgs.find((x) => x.id === messageId);
+  if (!m || !emoji) return null;
+  if (!m.reactions) m.reactions = {};
+  if (add) {
+    if (!m.reactions[emoji]) m.reactions[emoji] = [];
+    if (!m.reactions[emoji].includes(reactor)) {
+      m.reactions[emoji].push(reactor);
+    }
+  } else {
+    if (m.reactions[emoji]) {
+      m.reactions[emoji] = m.reactions[emoji].filter((n) => n !== reactor);
+      if (!m.reactions[emoji].length) delete m.reactions[emoji];
+    }
+  }
+  scheduleSave();
+  if (!silent) {
+    // broadcast to all participants
+    for (const p of convoParticipants(convoId)) {
+      if (!isBot(p)) send(clients.get(p), { type: 'reaction', convoId, id: messageId, reactions: m.reactions });
+    }
+  }
+  return m;
+}
+
 function botSay(convoId, botName, text) {
   const m = {
     id: nextId++, convoId, from: botName, kind: 'text', text,
-    media: null, ts: Date.now(), deliveredBy: [], readBy: [],
+    media: null, ts: Date.now(), deliveredBy: [], readBy: [], reactions: {},
   };
   for (const p of convoParticipants(convoId)) {
     if (p === botName) continue;
@@ -440,7 +493,7 @@ function handle(ws, msg) {
         setTimeout(() => {
           if (clients.has(name)) {
             botSay(key, 'Aria',
-              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact to chat, use 👥 in the sidebar to create a group, and try sharing a photo 📸 or voice note 🎙️. Type "help" to see everything.`);
+              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact to chat, use 👥 in the sidebar to create a group, share photos 📸, send voice notes 🎙️, or long-press a message to react with emoji 😍. Type "help" to see everything.`);
           }
         }, 1200);
       }
@@ -459,7 +512,7 @@ function handle(ws, msg) {
       if (kind !== 'text' && !media) return;
       const m = {
         id: nextId++, convoId, from, kind, text, media, ts: Date.now(),
-        deliveredBy: [], readBy: [],
+        deliveredBy: [], readBy: [], reactions: {},
       };
       pushMessage(m);
       send(ws, { type: 'message', message: m }); // echo to sender (assigns id/ts)
@@ -488,6 +541,8 @@ function handle(ws, msg) {
         scheduleSave();
       }
       maybeBotReact(convoId, m);
+      // bots may also react with emoji to human messages
+      setTimeout(() => botReactToMessage(convoId, from), 1500 + Math.random() * 2000);
       break;
     }
 
@@ -575,6 +630,22 @@ function handle(ws, msg) {
       scheduleSave();
       send(ws, { type: 'profile_saved', pic });
       broadcastUsers();
+      break;
+    }
+
+    case 'react': {
+      const from = ws.userName;
+      if (!from) return;
+      const convoId = String(msg.convoId || '');
+      const messageId = typeof msg.id === 'number' ? msg.id : null;
+      const emoji = typeof msg.emoji === 'string' ? msg.emoji.slice(0, 8) : null;
+      const add = msg.add !== false; // default true
+      if (!convoId || messageId === null || !emoji) return;
+      if (!canAccess(convoId, from)) return;
+      // Only allow a curated set of emojis
+      const ALLOWED_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🙏', '🔥', '🎉', '😍', '👎', '💯', '🤣'];
+      if (!ALLOWED_REACTIONS.includes(emoji)) return;
+      handleReact(convoId, from, messageId, emoji, add);
       break;
     }
   }

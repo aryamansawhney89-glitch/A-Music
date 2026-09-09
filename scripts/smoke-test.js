@@ -264,6 +264,26 @@ function makeWavDataUrl() {
     await bob.waitFor('users', (e) => e.users.some((u) => u.name === 'Alice' && u.pic === up1.json.url));
     ok('profile pic broadcast to everyone', true);
 
+    console.log('\n— message reactions —');
+    // Send a DM from Alice so Bob can react to it
+    alice.send({ type: 'message', convoId: dmAB, kind: 'text', text: 'react to this!' });
+    const reactTarget = await bob.waitFor('message', (e) => e.message.text === 'react to this!');
+    ok('message available for reaction', !!reactTarget);
+    // Bob reacts with ❤️
+    bob.send({ type: 'react', convoId: dmAB, id: reactTarget.message.id, emoji: '❤️', add: true });
+    const reactUpdate = await alice.waitFor('reaction', (e) => e.id === reactTarget.message.id);
+    ok('reaction broadcast to Alice', !!reactUpdate && reactUpdate.reactions['❤️'] && reactUpdate.reactions['❤️'].includes('Bob'));
+    // Bob removes the reaction
+    bob.send({ type: 'react', convoId: dmAB, id: reactTarget.message.id, emoji: '❤️', add: false });
+    const reactRemove = await alice.waitFor('reaction', (e) => e.id === reactTarget.message.id && (!e.reactions['❤️'] || !e.reactions['❤️'].includes('Bob')));
+    ok('reaction removal broadcast', !!reactRemove);
+    // Invalid emoji is rejected (no reaction event)
+    const eventsBefore = alice.events.length;
+    bob.send({ type: 'react', convoId: dmAB, id: reactTarget.message.id, emoji: '🚀', add: true });
+    await sleep(300);
+    const newReactEvents = alice.events.slice(eventsBefore).filter((e) => e.type === 'reaction' && e.id === reactTarget.message.id);
+    ok('invalid emoji rejected (no reaction broadcast)', newReactEvents.length === 0);
+
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
     ok('messages.json persisted', fs.existsSync(path.join(dataDir, 'messages.json')));

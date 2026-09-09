@@ -7,6 +7,7 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 
 - **Realtime messaging** between browser tabs / devices over WebSocket
 - **WhatsApp Web UI** — chat list, message bubbles with tails, date separators, ✓ / ✓✓ / blue-tick receipts
+- **Message reactions 😍** — long-press (or right-click) any message to react with emoji; bots also react to your messages; click a reaction chip to toggle yours
 - **Group chats 👥** — "New group" modal with name, optional group picture and member
   checkboxes; group messages show colored sender names; delivery/read ticks aggregate
   across all members
@@ -78,8 +79,8 @@ Start `npm start`, Plan **Free** → **Deploy**.
 - `server.js` — Express static host + `ws` WebSocket router + `/api/upload`. Every
   message carries a `convoId`: `dm::A::B` (two participants) or `grp::<id>` (group).
   Presence, typing and per-member delivered/read receipts (`deliveredBy` / `readBy`
-  arrays) travel as JSON frames; history, groups and profiles are kept in memory and
-  flushed to `data/messages.json`, `data/groups.json` and `data/users.json`.
+  arrays) travel as JSON frames; history, groups, profiles and reactions are kept in
+  memory and flushed to `data/messages.json`, `data/groups.json` and `data/users.json`.
   Uploaded media is written to `data/uploads` and served at `/uploads`.
 - `public/` — zero-build frontend (`index.html`, `style.css`, `app.js`) plus
   `public/avatars/*.svg` for the bot profile pictures.
