@@ -116,7 +116,6 @@ html[data-theme="dark"] .icon-btn:hover { background: rgba(255, 255, 255, 0.08);
 }
 
 /* ---------------- Join screen ---------------- */
-
 .join-screen {
   position: fixed;
   inset: 0;
@@ -939,6 +938,155 @@ html[data-theme="dark"] .reaction-chip.mine {
 
 /* Make the msg-row position relative for picker anchoring */
 .msg-row { position: relative; }
+
+/* ---------------- Auth screen ---------------- */
+
+.auth-card .auth-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 16px;
+  border-bottom: 2px solid var(--border);
+}
+.auth-tab {
+  flex: 1;
+  border: none;
+  background: none;
+  padding: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-soft);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.auth-tab:hover { color: var(--text); }
+.auth-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.auth-error {
+  color: #e53935;
+  font-size: 13px;
+  margin: -6px 0 10px;
+  min-height: 18px;
+}
+
+/* ---------------- Room modals ---------------- */
+
+.room-modal input,
+.join-room-modal input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 15px;
+  outline: none;
+  background: var(--input-bg);
+  color: var(--text);
+  margin-bottom: 12px;
+}
+.room-modal input:focus,
+.join-room-modal input:focus { border-color: var(--accent); }
+
+.rm-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 6px;
+}
+.rm-label .rm-or {
+  text-transform: none;
+  font-weight: 400;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+.rm-hint {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  margin-top: -4px;
+}
+.rm-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0 14px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+.rm-divider::before,
+.rm-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* invite card */
+.invite-room-name {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text);
+}
+.invite-label {
+  font-size: 13px;
+  color: var(--text-soft);
+  margin-bottom: 8px;
+}
+.invite-code {
+  display: inline-block;
+  font-family: "SF Mono", "Fira Code", "Courier New", monospace;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  padding: 14px 28px;
+  background: var(--hover);
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  color: var(--accent-dark);
+  user-select: all;
+}
+.invite-hint {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-top: 10px;
+}
+
+/* room chat header badge */
+.chat-header .room-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-dark);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+/* room member join notification */
+.room-notice {
+  text-align: center;
+  margin: 10px 0;
+}
+.room-notice span {
+  background: rgba(0, 168, 132, 0.12);
+  color: var(--accent-dark);
+  font-size: 12.5px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-weight: 500;
+}
+html[data-theme="dark"] .room-notice span {
+  color: var(--accent);
+  background: rgba(0, 168, 132, 0.15);
+}
 
 /* ---------------- Small screens ---------------- */
 

@@ -24,8 +24,11 @@ const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const MAX_HISTORY = 500;                  // per conversation
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8 MB decoded cap for /api/upload
+const PBKDF2_ITER = 10000;               // password hashing iterations
 
 /* ---------------------------------- bots ---------------------------------- */
 
@@ -172,10 +175,32 @@ const lastSeen = new Map();      // name -> ts (also lists offline users)
 const conversations = new Map(); // convoId -> message[]
 const groups = new Map();        // grp::<id> -> {id, name, pic, members, createdBy, createdAt}
 const profiles = new Map();      // name -> {name, pic, about}
+const accounts = new Map();      // username (lower) -> {username, salt, hash, createdAt}
+const rooms = new Map();         // room::<id> -> {id, name, salt, hash, members, createdBy, inviteCode, createdAt}
+const sessions = new Map();      // sessionToken -> username (lower)
 let nextId = 1;
 
 const dmConvoId = (a, b) => `dm::${[a, b].sort().join('::')}`;
 const newGroupId = () => `grp::${crypto.randomBytes(4).toString('hex')}`;
+const newRoomId = () => `room::${crypto.randomBytes(4).toString('hex')}`;
+const newInviteCode = () => crypto.randomBytes(3).toString('hex').toUpperCase(); // 6-char code
+
+/* ---------------------------- password helpers ---------------------------- */
+
+function hashPassword(password, salt) {
+  if (!salt) salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITER, 64, 'sha512').toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, hash) {
+  const result = hashPassword(password, salt);
+  return result.hash === hash;
+}
+
+function newSessionToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
 
 function convoParticipants(convoId) {
   if (typeof convoId !== 'string') return [];
@@ -183,6 +208,10 @@ function convoParticipants(convoId) {
   if (convoId.startsWith('grp::')) {
     const g = groups.get(convoId);
     return g ? [...g.members] : [];
+  }
+  if (convoId.startsWith('room::')) {
+    const r = rooms.get(convoId);
+    return r ? [...r.members] : [];
   }
   return [];
 }
@@ -243,6 +272,25 @@ function loadState() {
     }
   } catch { /* no profiles yet */ }
 
+  try {
+    const raw = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    for (const [key, a] of Object.entries(raw)) {
+      if (a && a.username && a.salt && a.hash) accounts.set(key, a);
+    }
+  } catch { /* no accounts yet */ }
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(ROOMS_FILE, 'utf8'));
+    for (const r of raw) {
+      if (r && r.id && r.name && r.salt && r.hash) {
+        r.members = Array.isArray(r.members) ? r.members : [];
+        rooms.set(r.id, r);
+        // also make sure the room convo exists
+        if (!conversations.has(r.id)) conversations.set(r.id, []);
+      }
+    }
+  } catch { /* no rooms yet */ }
+
   // make sure the bots always have their avatars + about text
   for (const b of BOTS) {
     const existing = profiles.get(b.name);
@@ -267,6 +315,8 @@ function saveAll() {
     fs.writeFileSync(MESSAGES_FILE, JSON.stringify(Object.fromEntries(conversations)));
     fs.writeFileSync(GROUPS_FILE, JSON.stringify([...groups.values()]));
     fs.writeFileSync(USERS_FILE, JSON.stringify(Object.fromEntries(profiles)));
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(Object.fromEntries(accounts)));
+    fs.writeFileSync(ROOMS_FILE, JSON.stringify([...rooms.values()]));
   } catch (err) {
     console.error('Save failed:', err.message);
   }
@@ -337,9 +387,22 @@ function groupsForUser(name) {
   return [...groups.values()].filter((g) => g.members.includes(name));
 }
 
+function roomsForUser(name) {
+  return [...rooms.values()].filter((r) => r.members.includes(name)).map((r) => ({
+    id: r.id, name: r.name, members: r.members, createdBy: r.createdBy,
+    inviteCode: r.inviteCode, createdAt: r.createdAt,
+  }));
+}
+
 function broadcastGroups() {
   for (const [name, ws] of clients) {
     send(ws, { type: 'groups', groups: groupsForUser(name) });
+  }
+}
+
+function broadcastRooms() {
+  for (const [name, ws] of clients) {
+    send(ws, { type: 'rooms', rooms: roomsForUser(name) });
   }
 }
 
@@ -473,6 +536,17 @@ function handle(ws, msg) {
       let name = String(msg.name || '').trim().replace(/\s+/g, ' ').slice(0, 24);
       if (!name) name = 'Guest-' + Math.floor(Math.random() * 1000);
       if (isBot(name)) name = name + ' (you)';
+
+      // Session token for returning users
+      const token = typeof msg.token === 'string' ? msg.token : null;
+      if (token) {
+        const sessionKey = sessions.get(token);
+        if (sessionKey) {
+          const acct = accounts.get(sessionKey);
+          if (acct) name = acct.username;
+        }
+      }
+
       const existing = clients.get(name);
       if (existing && existing !== ws) {
         send(existing, { type: 'kicked', reason: 'You signed in from another tab.' });
@@ -485,7 +559,7 @@ function handle(ws, msg) {
         profiles.set(name, { name, pic: null, about: '' });
         scheduleSave();
       }
-      send(ws, { type: 'joined', name, users: userList(), groups: groupsForUser(name) });
+      send(ws, { type: 'joined', name, users: userList(), groups: groupsForUser(name), rooms: roomsForUser(name), hasAccount: accounts.has(name.toLowerCase()) });
       broadcastUsers();
       markDeliveredFor(name);
       const key = dmConvoId(name, 'Aria');
@@ -493,7 +567,7 @@ function handle(ws, msg) {
         setTimeout(() => {
           if (clients.has(name)) {
             botSay(key, 'Aria',
-              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact to chat, use 👥 in the sidebar to create a group, share photos 📸, send voice notes 🎙️, or long-press a message to react with emoji 😍. Type "help" to see everything.`);
+              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact to chat, use 👥 to create a group, 🔒 to create a password-protected room, or long-press a message to react 😍. Type "help" to see everything.`);
           }
         }, 1200);
       }
@@ -646,6 +720,157 @@ function handle(ws, msg) {
       const ALLOWED_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🙏', '🔥', '🎉', '😍', '👎', '💯', '🤣'];
       if (!ALLOWED_REACTIONS.includes(emoji)) return;
       handleReact(convoId, from, messageId, emoji, add);
+      break;
+    }
+
+    case 'register': {
+      const username = String(msg.username || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+      const password = String(msg.password || '');
+      if (!username || username.length < 2) {
+        send(ws, { type: 'auth_error', error: 'Username must be at least 2 characters.' });
+        return;
+      }
+      if (!password || password.length < 3) {
+        send(ws, { type: 'auth_error', error: 'Password must be at least 3 characters.' });
+        return;
+      }
+      if (isBot(username)) {
+        send(ws, { type: 'auth_error', error: 'That username is reserved.' });
+        return;
+      }
+      const key = username.toLowerCase();
+      if (accounts.has(key)) {
+        send(ws, { type: 'auth_error', error: 'Username already taken.' });
+        return;
+      }
+      const { salt, hash } = hashPassword(password);
+      const account = { username, salt, hash, createdAt: Date.now() };
+      accounts.set(key, account);
+      // create profile if not exists
+      if (!profiles.has(username)) {
+        profiles.set(username, { name: username, pic: null, about: '' });
+      }
+      // create session
+      const token = newSessionToken();
+      sessions.set(token, key);
+      scheduleSave();
+      send(ws, { type: 'auth_ok', username, token, isNew: true });
+      break;
+    }
+
+    case 'login': {
+      const username = String(msg.username || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+      const password = String(msg.password || '');
+      const key = username.toLowerCase();
+      const account = accounts.get(key);
+      if (!account) {
+        send(ws, { type: 'auth_error', error: 'Account not found. Please register first.' });
+        return;
+      }
+      if (!verifyPassword(password, account.salt, account.hash)) {
+        send(ws, { type: 'auth_error', error: 'Incorrect password.' });
+        return;
+      }
+      // create session
+      const token = newSessionToken();
+      sessions.set(token, key);
+      // check if session token was provided (reconnect)
+      send(ws, { type: 'auth_ok', username: account.username, token, isNew: false });
+      break;
+    }
+
+    case 'room_create': {
+      const from = ws.userName;
+      if (!from) return;
+      const name = String(msg.name || '').trim().slice(0, 50);
+      const password = String(msg.password || '');
+      if (!name) {
+        send(ws, { type: 'error', error: 'Room name is required.' });
+        return;
+      }
+      if (!password || password.length < 3) {
+        send(ws, { type: 'error', error: 'Room password must be at least 3 characters.' });
+        return;
+      }
+      const { salt, hash } = hashPassword(password);
+      const room = {
+        id: newRoomId(),
+        name,
+        salt,
+        hash,
+        members: [from],
+        createdBy: from,
+        inviteCode: newInviteCode(),
+        createdAt: Date.now(),
+      };
+      rooms.set(room.id, room);
+      conversations.set(room.id, []);
+      scheduleSave();
+      send(ws, { type: 'room_created', room: { id: room.id, name: room.name, members: room.members, createdBy: room.createdBy, inviteCode: room.inviteCode, createdAt: room.createdAt } });
+      broadcastRooms();
+      break;
+    }
+
+    case 'room_join': {
+      const from = ws.userName;
+      if (!from) return;
+      const roomId = String(msg.roomId || '');
+      const password = String(msg.password || '');
+      const inviteCode = String(msg.inviteCode || '').toUpperCase().trim();
+      const room = rooms.get(roomId);
+      if (!room) {
+        // try finding by invite code
+        if (inviteCode) {
+          const found = [...rooms.values()].find((r) => r.inviteCode === inviteCode);
+          if (found) {
+            // invite code bypasses password
+            if (!found.members.includes(from)) {
+              found.members.push(from);
+              scheduleSave();
+              broadcastRooms();
+              send(ws, { type: 'room_joined', room: { id: found.id, name: found.name, members: found.members, createdBy: found.createdBy, inviteCode: found.inviteCode, createdAt: found.createdAt } });
+              // notify existing members
+              for (const m of found.members) {
+                if (m !== from && clients.has(m)) {
+                  send(clients.get(m), { type: 'room_member_joined', roomId: found.id, member: from });
+                }
+              }
+              return;
+            }
+            send(ws, { type: 'room_joined', room: { id: found.id, name: found.name, members: found.members, createdBy: found.createdBy, inviteCode: found.inviteCode, createdAt: found.createdAt } });
+            return;
+          }
+        }
+        send(ws, { type: 'error', error: 'Room not found.' });
+        return;
+      }
+      // already a member?
+      if (room.members.includes(from)) {
+        send(ws, { type: 'room_joined', room: { id: room.id, name: room.name, members: room.members, createdBy: room.createdBy, inviteCode: room.inviteCode, createdAt: room.createdAt } });
+        return;
+      }
+      // verify password
+      if (!password || !verifyPassword(password, room.salt, room.hash)) {
+        send(ws, { type: 'error', error: 'Incorrect room password.' });
+        return;
+      }
+      room.members.push(from);
+      scheduleSave();
+      broadcastRooms();
+      send(ws, { type: 'room_joined', room: { id: room.id, name: room.name, members: room.members, createdBy: room.createdBy, inviteCode: room.inviteCode, createdAt: room.createdAt } });
+      // notify existing members
+      for (const m of room.members) {
+        if (m !== from && clients.has(m)) {
+          send(clients.get(m), { type: 'room_member_joined', roomId: room.id, member: from });
+        }
+      }
+      break;
+    }
+
+    case 'room_list': {
+      const from = ws.userName;
+      if (!from) return;
+      send(ws, { type: 'rooms', rooms: roomsForUser(from) });
       break;
     }
   }

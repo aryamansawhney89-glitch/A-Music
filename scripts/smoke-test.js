@@ -284,6 +284,91 @@ function makeWavDataUrl() {
     const newReactEvents = alice.events.slice(eventsBefore).filter((e) => e.type === 'reaction' && e.id === reactTarget.message.id);
     ok('invalid emoji rejected (no reaction broadcast)', newReactEvents.length === 0);
 
+    console.log('\n— user accounts —');
+    // Use a third client for auth tests
+    const carol = new Client('Carol');
+    await carol.connect();
+    // Register
+    carol.send({ type: 'register', username: 'Carol', password: 'secret123' });
+    const authOk = await carol.waitFor('auth_ok');
+    ok('register returns auth_ok with token', authOk.username === 'Carol' && typeof authOk.token === 'string' && authOk.isNew === true);
+    // Duplicate registration
+    const dave = new Client('Dave');
+    await dave.connect();
+    dave.send({ type: 'register', username: 'Carol', password: 'other' });
+    const dupErr = await dave.waitFor('auth_error');
+    ok('duplicate registration rejected', dupErr.error.includes('already taken'));
+    // Login with correct password
+    dave.send({ type: 'login', username: 'Carol', password: 'secret123' });
+    const loginOk = await dave.waitFor('auth_ok');
+    ok('login with correct password succeeds', loginOk.username === 'Carol' && loginOk.isNew === false);
+    // Login with wrong password
+    const eve = new Client('Eve');
+    await eve.connect();
+    eve.send({ type: 'login', username: 'Carol', password: 'wrong' });
+    const badLogin = await eve.waitFor('auth_error');
+    ok('login with wrong password rejected', badLogin.error.includes('Incorrect'));
+    // Short password rejected
+    const frank = new Client('Frank');
+    await frank.connect();
+    frank.send({ type: 'register', username: 'Frank', password: 'ab' });
+    const shortPw = await frank.waitFor('auth_error');
+    ok('short password rejected', shortPw.error.includes('at least 3'));
+    frank.close();
+    // Join after registration
+    carol.send({ type: 'join', name: 'Carol', token: authOk.token });
+    const carolJoined = await carol.waitFor('joined');
+    ok('join after auth returns rooms array', Array.isArray(carolJoined.rooms));
+    dave.close();
+    eve.close();
+
+    console.log('\n— rooms —');
+    // Alice creates a room
+    alice.send({ type: 'room_create', name: 'Secret Club', password: 'pass123' });
+    const roomCreated = await alice.waitFor('room_created');
+    ok('room created with invite code', roomCreated.room.name === 'Secret Club' && typeof roomCreated.room.inviteCode === 'string' && roomCreated.room.inviteCode.length === 6);
+    const roomId = roomCreated.room.id;
+    ok('room id uses room:: prefix', roomId.startsWith('room::'));
+
+    // Bob joins with correct password
+    bob.send({ type: 'room_join', roomId, password: 'pass123', inviteCode: '' });
+    const bobJoined = await bob.waitFor('room_joined', (e) => e.room.id === roomId);
+    ok('room join with correct password', bobJoined.room.members.includes('Bob'));
+    // Bob is now notified to Alice
+    await alice.waitFor('room_member_joined', (e) => e.roomId === roomId && e.member === 'Bob');
+    ok('room member joined notification', true);
+
+    // Bob tries wrong password (need new room)
+    alice.send({ type: 'room_create', name: 'VIP Room', password: 'vip999' });
+    const room2 = await alice.waitFor('room_created');
+    const room2Id = room2.room.id;
+    // Use Carol (who is already connected from auth tests but not a member of room2)
+    carol.send({ type: 'room_join', roomId: room2Id, password: 'wrong', inviteCode: '' });
+    const roomErr = await carol.waitFor('error', (e) => (e.error || '').includes('Incorrect'));
+    ok('room join with wrong password rejected', !!roomErr);
+
+    // Join by invite code (bypasses password)
+    carol.send({ type: 'room_join', roomId: '', inviteCode: roomCreated.room.inviteCode, password: '' });
+    const carolRoomJoined = await carol.waitFor('room_joined', (e) => e.room.id === roomId);
+    ok('room join by invite code', carolRoomJoined.room.members.includes('Carol'));
+
+    // Send message in room
+    alice.send({ type: 'message', convoId: roomId, kind: 'text', text: 'welcome to the secret club' });
+    const roomMsg = await bob.waitFor('message', (e) => e.message.convoId === roomId && e.message.text === 'welcome to the secret club');
+    ok('room message reaches members', !!roomMsg);
+    // Non-member cannot read room history
+    // Use a fresh client that is not a member of room2
+    const guest = new Client('Guest');
+    await guest.connect();
+    guest.send({ type: 'join', name: 'Guest' });
+    await guest.waitFor('joined');
+    guest.send({ type: 'history', convoId: room2Id });
+    const noAccess = await guest.waitFor('history', (e) => e.convoId === room2Id);
+    ok('non-member gets empty history for room', Array.isArray(noAccess.messages) && noAccess.messages.length === 0);
+    guest.close();
+
+    carol.close();
+
     console.log('\n— persistence —');
     await sleep(800); // allow debounced save
     ok('messages.json persisted', fs.existsSync(path.join(dataDir, 'messages.json')));
@@ -294,6 +379,11 @@ function makeWavDataUrl() {
       'users.json persisted (Alice pic + bot avatars)',
       usersRaw.Alice && usersRaw.Alice.pic === up1.json.url && usersRaw.Aria.pic.endsWith('.svg') && usersRaw['DJ Nova'].pic.endsWith('.svg')
     );
+    ok('accounts.json persisted', fs.existsSync(path.join(dataDir, 'accounts.json')));
+    const accountsRaw = JSON.parse(fs.readFileSync(path.join(dataDir, 'accounts.json'), 'utf8'));
+    ok('account stored with salt and hash', accountsRaw.carol && accountsRaw.carol.salt && accountsRaw.carol.hash);
+    const roomsRaw = JSON.parse(fs.readFileSync(path.join(dataDir, 'rooms.json'), 'utf8'));
+    ok('rooms.json persisted with new rooms', roomsRaw.length >= 2 && roomsRaw.some((r) => r.name === 'Secret Club'));
 
     alice.close();
     bob.close();
