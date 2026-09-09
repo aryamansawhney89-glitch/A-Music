@@ -18,7 +18,7 @@
       <p class="join-sub">Real-time messaging, WhatsApp style.</p>
       <input id="nameInput" maxlength="24" placeholder="Enter your name" autocomplete="off" />
       <button id="joinBtn">Start chatting</button>
-      <p class="join-hint">Tip: open this page in a second tab and join with a different name to chat live between users.</p>
+      <p class="join-hint">Tip: open this page in a second tab and join with a different name to chat live between users — or create a group with the 👥 button in the sidebar.</p>
     </div>
   </div>
 
@@ -26,9 +26,12 @@
   <div id="app" class="app hidden">
     <aside class="sidebar" id="sidebar">
       <header class="side-header">
-        <div class="avatar" id="myAvatar">?</div>
+        <div class="my-avatar-wrap" id="myAvatarWrap" title="Change your profile picture">
+          <div class="avatar" id="myAvatar">?</div>
+        </div>
         <div class="me-name" id="myName"></div>
         <div class="side-actions">
+          <button id="newGroupBtn" class="icon-btn" title="New group">👥</button>
           <button id="themeBtn" class="icon-btn" title="Toggle dark mode">🌙</button>
           <button id="logoutBtn" class="icon-btn" title="Log out">⏻</button>
         </div>
@@ -44,7 +47,7 @@
       <div id="emptyState" class="empty-state">
         <div class="empty-art"><span>💬</span></div>
         <h2>A-Chat Web</h2>
-        <p>Send and receive messages in real time.<br />Pick a chat from the sidebar to get started.</p>
+        <p>Send and receive messages, photos 📸 and voice notes 🎙️ in real time.<br />Create a group with the 👥 button, and tap your avatar to set a profile picture.</p>
         <p class="enc-note">🔒 Demo app — messages live on this server only.</p>
       </div>
 
@@ -59,20 +62,70 @@
         </header>
         <div class="messages" id="messages"></div>
         <div class="emoji-panel hidden" id="emojiPanel"></div>
-        <footer class="composer">
-          <button id="emojiBtn" class="icon-btn" title="Emoji">😊</button>
-          <button id="attachBtn" class="icon-btn" title="Attach">📎</button>
-          <textarea id="msgInput" rows="1" placeholder="Type a message"></textarea>
-          <button id="sendBtn" class="send-btn hidden" title="Send">
-            <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.7 11.2 21.3 2.1c.6-.3 1.2.3 1 .9l-8.2 18.6c-.3.6-1.2.6-1.4-.1l-2-6.6c-.1-.3-.3-.5-.6-.6l-6.8-1.7c-.6-.2-.7-1.1-.1-1.4Z"/></svg>
-          </button>
-          <button id="micBtn" class="icon-btn" title="Voice message">🎤</button>
-        </footer>
+        <div class="composer-area">
+          <footer class="composer" id="composerBar">
+            <button id="emojiBtn" class="icon-btn" title="Emoji">😊</button>
+            <button id="attachBtn" class="icon-btn" title="Send photo">📎</button>
+            <textarea id="msgInput" rows="1" placeholder="Type a message"></textarea>
+            <button id="sendBtn" class="send-btn hidden" title="Send">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.7 11.2 21.3 2.1c.6-.3 1.2.3 1 .9l-8.2 18.6c-.3.6-1.2.6-1.4-.1l-2-6.6c-.1-.3-.3-.5-.6-.6l-6.8-1.7c-.6-.2-.7-1.1-.1-1.4Z"/></svg>
+            </button>
+            <button id="micBtn" class="icon-btn" title="Record voice message">🎤</button>
+          </footer>
+          <div class="recording-bar hidden" id="recordingBar">
+            <button id="recCancelBtn" class="icon-btn rec-cancel" title="Cancel recording">🗑️</button>
+            <div class="rec-timer"><span class="rec-dot"></span><span id="recTime">0:00</span></div>
+            <div class="rec-hint">Recording voice message…</div>
+            <button id="recSendBtn" class="send-btn" title="Send voice message">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.7 11.2 21.3 2.1c.6-.3 1.2.3 1 .9l-8.2 18.6c-.3.6-1.2.6-1.4-.1l-2-6.6c-.1-.3-.3-.5-.6-.6l-6.8-1.7c-.6-.2-.7-1.1-.1-1.4Z"/></svg>
+            </button>
+          </div>
+        </div>
       </section>
     </main>
   </div>
 
+  <!-- Photo caption / preview modal -->
+  <div id="photoModal" class="modal-overlay hidden">
+    <div class="modal photo-modal">
+      <header><span>Send photo</span><button id="photoCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <img id="photoPreview" alt="Photo preview" />
+      <textarea id="photoCaption" rows="2" placeholder="Add a caption…"></textarea>
+      <footer>
+        <button id="photoCancelBtn" class="btn">Cancel</button>
+        <button id="photoSendBtn" class="btn primary">Send</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- New group modal -->
+  <div id="groupModal" class="modal-overlay hidden">
+    <div class="modal group-modal">
+      <header><span>New group</span><button id="groupCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <div class="gm-top">
+          <div id="groupPicWrap" class="group-pic" title="Choose a group picture"><span id="groupPicIcon">👥</span></div>
+          <input id="groupNameInput" maxlength="50" placeholder="Group name (required)" autocomplete="off" />
+        </div>
+        <div class="gm-label">Add members</div>
+        <div id="groupMembers" class="gm-members"></div>
+      </div>
+      <footer>
+        <button id="groupCancelBtn" class="btn">Cancel</button>
+        <button id="groupCreateBtn" class="btn primary">Create group</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Photo lightbox -->
+  <div id="lightbox" class="lightbox hidden"><img id="lightboxImg" alt="Photo" /></div>
+
   <div id="toast" class="toast hidden"></div>
+
+  <input type="file" id="photoInput" accept="image/*" hidden />
+  <input type="file" id="avatarInput" accept="image/*" hidden />
+  <input type="file" id="groupPicInput" accept="image/*" hidden />
+
   <script src="app.js"></script>
 </body>
 </html>

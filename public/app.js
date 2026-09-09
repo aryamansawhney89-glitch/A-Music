@@ -1,6 +1,8 @@
 'use strict';
 
-/* ================================ A-Chat client ================================ */
+/* ================================ A-Chat client ================================
+   Supports DMs + group chats (convoId routing), photo sharing with captions,
+   voice messages with waveform players, and profile pictures.               */
 
 const $ = (id) => document.getElementById(id);
 
@@ -26,6 +28,8 @@ const searchInput = $('searchInput');
 const themeBtn = $('themeBtn');
 const logoutBtn = $('logoutBtn');
 const backBtn = $('backBtn');
+const newGroupBtn = $('newGroupBtn');
+const myAvatarWrap = $('myAvatarWrap');
 const toastEl = $('toast');
 
 /* ---------------------------------- state ---------------------------------- */
@@ -34,9 +38,11 @@ const state = {
   me: null,
   ws: null,
   connected: false,
-  users: [],            // [{name, online, bot, lastSeen}]
-  chats: new Map(),     // name -> {messages: [], unread: 0, lastTs: 0}
-  active: null,
+  recording: false,
+  users: [],            // [{name, online, bot, lastSeen, pic, about}]
+  groups: new Map(),    // grp::<id> -> group
+  chats: new Map(),     // convoId -> {messages: [], unread: 0, lastTs: 0}
+  active: null,         // active convoId
   lastDateLabel: null,
 };
 
@@ -46,15 +52,41 @@ function avatarColor(name) {
   for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
 }
-const initialOf = (name) => (name.trim()[0] || '?').toUpperCase();
+const initialOf = (name) => (String(name).trim()[0] || '?').toUpperCase();
+
+function applyAvatar(el, name, pic, icon) {
+  if (pic) {
+    el.style.background = 'var(--panel-header)';
+    el.style.backgroundImage = `url("${pic}")`;
+    el.textContent = '';
+  } else {
+    el.style.backgroundImage = '';
+    el.style.background = avatarColor(name);
+    el.textContent = icon || initialOf(name);
+  }
+}
+
+/* ------------------------------- tick (receipt) icons ---------------------- */
 
 const TICK_SINGLE = `<svg viewBox="0 0 16 11" class="tick"><path d="M14.5 1 6 9.5 1.5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const TICK_DOUBLE = `<svg viewBox="0 0 20 11" class="tick"><path d="M11.5 1 4.5 9.5 1.2 6.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M18.5 1 11.5 9.5 10.2 8.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
+// Ticks aggregate across members: double-blue only when everyone has read.
+function tickState(m) {
+  if (m.from !== state.me) return null;
+  const meta = metaFor(m.convoId);
+  const others = meta ? meta.members.filter((n) => n !== state.me) : [];
+  if (!others.length) return 'sent';
+  if (others.every((n) => (m.readBy || []).includes(n))) return 'read';
+  if (others.every((n) => (m.deliveredBy || []).includes(n))) return 'delivered';
+  return 'sent';
+}
+
 function tickSVG(m) {
-  if (m.from !== state.me) return '';
-  if (m.read) return TICK_DOUBLE.replace('class="tick"', 'class="tick read"');
-  if (m.delivered) return TICK_DOUBLE;
+  const s = tickState(m);
+  if (!s) return '';
+  if (s === 'read') return TICK_DOUBLE.replace('class="tick"', 'class="tick read"');
+  if (s === 'delivered') return TICK_DOUBLE;
   return TICK_SINGLE;
 }
 
@@ -77,6 +109,11 @@ function dateLabel(ts) {
 function listTime(ts) {
   const label = dateLabel(ts);
   return label === 'Today' ? timeHM(ts) : label === 'Yesterday' ? 'Yesterday' : new Date(ts).toLocaleDateString();
+}
+
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }
 
 let toastTimer = null;
@@ -104,13 +141,39 @@ function pop(freq) {
   } catch { /* audio not available */ }
 }
 
-function getChat(name) {
-  if (!state.chats.has(name)) state.chats.set(name, { messages: [], unread: 0, lastTs: 0 });
-  return state.chats.get(name);
+/* ------------------------------ convo helpers ------------------------------ */
+
+const dmConvoId = (a, b) => `dm::${[a, b].sort().join('::')}`;
+
+function metaFor(convoId) {
+  if (typeof convoId !== 'string') return null;
+  if (convoId.startsWith('dm::')) {
+    const [a, b] = convoId.slice(4).split('::').filter(Boolean);
+    if (!a || !b) return null;
+    const other = a === state.me ? b : a;
+    const u = findUser(other);
+    return { kind: 'dm', members: [a, b].sort(), title: other, pic: u ? u.pic : null, user: u };
+  }
+  if (convoId.startsWith('grp::')) {
+    const g = state.groups.get(convoId);
+    if (!g) return null;
+    return { kind: 'group', members: [...g.members], title: g.name, pic: g.pic, group: g };
+  }
+  return null;
+}
+
+function getChat(convoId) {
+  if (!state.chats.has(convoId)) state.chats.set(convoId, { messages: [], unread: 0, lastTs: 0 });
+  return state.chats.get(convoId);
 }
 
 function findUser(name) {
   return state.users.find((u) => u.name === name);
+}
+
+function myPic() {
+  const u = state.me && findUser(state.me);
+  return u ? u.pic : null;
 }
 
 /* ------------------------------ websocket ---------------------------------- */
@@ -167,6 +230,7 @@ function handle(msg) {
     case 'joined': {
       state.me = msg.name;
       state.users = msg.users || [];
+      state.groups = new Map((msg.groups || []).map((g) => [g.id, g]));
       joinScreen.classList.add('hidden');
       app.classList.remove('hidden');
       renderMe();
@@ -176,33 +240,56 @@ function handle(msg) {
 
     case 'users': {
       state.users = msg.users || [];
+      renderMe();
       renderChatList();
       updateActiveHeader();
       break;
     }
 
+    case 'groups': {
+      state.groups = new Map((msg.groups || []).map((g) => [g.id, g]));
+      renderChatList();
+      updateActiveHeader();
+      break;
+    }
+
+    case 'group_created': {
+      state.groups.set(msg.group.id, msg.group);
+      closeGroupModal();
+      toast(`Group "${msg.group.name}" created 🎉`);
+      openChat(msg.group.id);
+      break;
+    }
+
+    case 'profile_saved': {
+      renderMe();
+      renderChatList();
+      toast('Profile picture updated 👤');
+      break;
+    }
+
     case 'message': {
       const m = msg.message;
-      const other = m.from === state.me ? m.to : m.from;
-      const chat = getChat(other);
+      const chat = getChat(m.convoId);
+      const prev = chat.messages[chat.messages.length - 1];
       chat.messages.push(m);
       chat.lastTs = m.ts;
-      clearTyping(other);
+      clearTyping(m.convoId);
 
-      if (other === state.active && !chatView.classList.contains('hidden')) {
-        appendMessage(m, chat.messages[chat.messages.length - 2]);
+      if (m.convoId === state.active && !chatView.classList.contains('hidden')) {
+        appendMessage(m, prev);
         maybeScroll(m);
-        if (m.to === state.me && document.hasFocus()) {
-          wsSend({ type: 'read', with: other });
-        } else if (m.to === state.me) {
+        if (m.from !== state.me && document.hasFocus()) {
+          wsSend({ type: 'read', convoId: m.convoId });
+        } else if (m.from !== state.me) {
           chat.unread++;
         }
-      } else if (m.to === state.me) {
+      } else if (m.from !== state.me) {
         chat.unread++;
       }
 
       if (m.from === state.me) pop(520);
-      else if (other !== state.active || !document.hasFocus()) pop(880);
+      else if (m.convoId !== state.active || !document.hasFocus()) pop(880);
 
       renderChatList();
       updateTitleBadge();
@@ -210,12 +297,12 @@ function handle(msg) {
     }
 
     case 'history': {
-      const chat = getChat(msg.with);
+      const chat = getChat(msg.convoId);
       chat.messages = msg.messages || [];
       chat.lastTs = chat.messages.length ? chat.messages[chat.messages.length - 1].ts : 0;
-      if (state.active === msg.with) {
+      if (state.active === msg.convoId) {
         renderMessages(chat);
-        wsSend({ type: 'read', with: msg.with });
+        wsSend({ type: 'read', convoId: msg.convoId });
         chat.unread = 0;
         renderChatList();
         updateTitleBadge();
@@ -223,28 +310,36 @@ function handle(msg) {
       break;
     }
 
-    case 'status':
-    case 'read': {
-      const chatName = msg.with || msg.by;
-      const chat = getChat(chatName);
+    case 'status': {
+      const chat = getChat(msg.convoId);
       const m = chat.messages.find((x) => x.id === msg.id);
       if (m) {
-        if (msg.type === 'read') m.read = true;
-        else { m.delivered = msg.delivered; m.read = msg.read; }
-        const el = messagesEl.querySelector(`[data-id="${m.id}"] .meta .ticks`);
-        if (el) el.innerHTML = tickSVG(m);
+        if (Array.isArray(msg.deliveredBy)) m.deliveredBy = msg.deliveredBy;
+        if (Array.isArray(msg.readBy)) m.readBy = msg.readBy;
+        if (state.active === m.convoId) {
+          const el = messagesEl.querySelector(`[data-id="${m.id}"] .ticks`);
+          if (el) el.innerHTML = tickSVG(m);
+        }
+        renderChatList();
       }
-      renderChatList();
       break;
     }
 
     case 'typing': {
-      if (msg.from === state.active) showTyping(msg.from, msg.isTyping);
+      if (msg.convoId === state.active) showTyping(msg.convoId, msg.from, msg.isTyping);
+      break;
+    }
+
+    case 'error': {
+      toast(msg.error || 'Something went wrong');
+      groupCreateBtn.disabled = false;
+      photoSendBtn.disabled = false;
       break;
     }
 
     case 'kicked': {
       state.me = null;
+      state.active = null;
       toast(msg.reason || 'Signed in elsewhere');
       app.classList.add('hidden');
       joinScreen.classList.remove('hidden');
@@ -257,16 +352,26 @@ function handle(msg) {
 
 function renderMe() {
   $('myName').textContent = state.me;
-  const av = $('myAvatar');
-  av.textContent = initialOf(state.me);
-  av.style.background = avatarColor(state.me);
+  applyAvatar($('myAvatar'), state.me, myPic());
 }
 
-function contacts() {
-  return state.users
-    .filter((u) => u.name !== state.me)
-    .map((u) => ({ ...u, chat: getChat(u.name) }))
-    .sort((a, b) => (b.chat.lastTs - a.chat.lastTs) || a.name.localeCompare(b.name));
+function listEntries() {
+  const entries = [];
+  for (const u of state.users) {
+    if (u.name === state.me) continue;
+    const id = dmConvoId(state.me, u.name);
+    entries.push({ id, title: u.name, pic: u.pic, user: u, chat: getChat(id) });
+  }
+  for (const g of state.groups.values()) {
+    entries.push({ id: g.id, title: g.name, pic: g.pic, group: g, chat: getChat(g.id) });
+  }
+  return entries.sort((a, b) => (b.chat.lastTs - a.chat.lastTs) || a.title.localeCompare(b.title));
+}
+
+function previewText(m) {
+  if (m.kind === 'photo') return '📸 Photo' + (m.text ? `: ${m.text}` : '');
+  if (m.kind === 'voice') return '🎙️ Voice message';
+  return m.text;
 }
 
 function renderChatList() {
@@ -274,17 +379,17 @@ function renderChatList() {
   chatListEl.innerHTML = '';
   let any = false;
 
-  for (const c of contacts()) {
-    if (filter && !c.name.toLowerCase().includes(filter)) continue;
+  for (const c of listEntries()) {
+    if (filter && !c.title.toLowerCase().includes(filter)) continue;
     any = true;
+    const isGroup = !!c.group;
     const item = document.createElement('div');
-    item.className = 'chat-item' + (c.name === state.active ? ' active' : '');
-    item.addEventListener('click', () => openChat(c.name));
+    item.className = 'chat-item' + (c.id === state.active ? ' active' : '');
+    item.addEventListener('click', () => openChat(c.id));
 
     const av = document.createElement('div');
     av.className = 'avatar';
-    av.style.background = avatarColor(c.name);
-    av.textContent = initialOf(c.name);
+    applyAvatar(av, c.title, c.pic, isGroup ? '👥' : undefined);
 
     const body = document.createElement('div');
     body.className = 'ci-body';
@@ -293,8 +398,8 @@ function renderChatList() {
     top.className = 'ci-top';
     const nameEl = document.createElement('span');
     nameEl.className = 'ci-name';
-    nameEl.textContent = c.name;
-    if (c.bot) {
+    nameEl.textContent = c.title;
+    if (c.user && c.user.bot) {
       const tag = document.createElement('span');
       tag.className = 'bot-tag';
       tag.textContent = 'BOT';
@@ -316,11 +421,19 @@ function renderChatList() {
         t.innerHTML = tickSVG(last);
         prev.appendChild(t);
       }
+      if (isGroup && last.from !== state.me) {
+        const who = document.createElement('span');
+        who.className = 'ci-sender';
+        who.textContent = `${last.from}: `;
+        prev.appendChild(who);
+      }
       const txt = document.createElement('span');
-      txt.textContent = last.text;
+      txt.textContent = previewText(last);
       prev.appendChild(txt);
+    } else if (isGroup) {
+      prev.textContent = `${c.group.members.length} members`;
     } else {
-      prev.textContent = c.online ? (c.bot ? 'bot • online' : 'online') : 'tap to start chatting';
+      prev.textContent = c.user && c.user.online ? (c.user.bot ? 'bot • online' : 'online') : 'tap to start chatting';
     }
     bottom.appendChild(prev);
     if (c.chat.unread) {
@@ -345,28 +458,29 @@ function renderChatList() {
   }
 }
 
-function openChat(name) {
-  state.active = name;
+function openChat(convoId) {
+  const meta = metaFor(convoId);
+  if (!meta) return;
+  state.active = convoId;
   emptyState.classList.add('hidden');
   chatView.classList.remove('hidden');
   document.body.classList.add('chat-open');
 
-  const u = findUser(name);
-  chatTitle.textContent = name;
-  chatAvatar.textContent = initialOf(name);
-  chatAvatar.style.background = avatarColor(name);
+  chatTitle.textContent = meta.title;
+  applyAvatar(chatAvatar, meta.group ? meta.group.id : meta.title, meta.pic, meta.kind === 'group' ? '👥' : undefined);
   updateActiveHeader();
 
-  const chat = getChat(name);
+  const chat = getChat(convoId);
   chat.unread = 0;
   if (chat.messages.length) {
     renderMessages(chat);
-    wsSend({ type: 'read', with: name });
+    wsSend({ type: 'read', convoId });
   } else {
     messagesEl.innerHTML = '';
     state.lastDateLabel = null;
+    typingRowEl = null;
   }
-  wsSend({ type: 'history', with: name }); // refresh from server + mark delivered
+  wsSend({ type: 'history', convoId }); // refresh from server + mark delivered
 
   renderChatList();
   updateTitleBadge();
@@ -375,17 +489,26 @@ function openChat(name) {
 
 function updateActiveHeader() {
   if (!state.active) return;
-  const u = findUser(state.active);
-  if (!u) { chatStatus.textContent = ''; return; }
-  if (chatStatus.dataset.typing === '1') return; // don't stomp typing indicator
-  chatStatus.className = 'chat-status';
-  if (u.online) {
-    chatStatus.textContent = 'online';
-    chatStatus.classList.add('online');
-  } else if (u.lastSeen) {
-    chatStatus.textContent = `last seen ${listTime(u.lastSeen)}`;
+  const meta = metaFor(state.active);
+  if (!meta) return;
+  if (meta.kind === 'group') {
+    if (chatStatus.dataset.typing === '1') return;
+    const others = meta.members.filter((n) => n !== state.me);
+    chatStatus.className = 'chat-status';
+    chatStatus.textContent = others.length ? others.join(', ') : 'just you';
   } else {
-    chatStatus.textContent = 'offline';
+    const u = meta.user;
+    if (!u) { chatStatus.textContent = ''; return; }
+    if (chatStatus.dataset.typing === '1') return; // don't stomp typing indicator
+    chatStatus.className = 'chat-status';
+    if (u.online) {
+      chatStatus.textContent = 'online';
+      chatStatus.classList.add('online');
+    } else if (u.lastSeen) {
+      chatStatus.textContent = `last seen ${listTime(u.lastSeen)}`;
+    } else {
+      chatStatus.textContent = 'offline';
+    }
   }
 }
 
@@ -400,8 +523,99 @@ function daySep(label) {
   return sep;
 }
 
+const PLAY_SVG = '<svg viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></svg>';
+const PAUSE_SVG = '<svg viewBox="0 0 24 24"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" fill="currentColor"/></svg>';
+
+let currentAudio = null;
+let currentVoiceUI = null;
+function stopCurrentVoice() {
+  if (currentAudio) currentAudio.pause();
+  if (currentVoiceUI) currentVoiceUI.reset();
+  currentAudio = null;
+  currentVoiceUI = null;
+}
+
+function buildVoicePlayer(m) {
+  const media = m.media || {};
+  const wave = Array.isArray(media.wave) && media.wave.length
+    ? media.wave
+    : Array.from({ length: 40 }, () => 30);
+  const totalDur = media.duration || 0;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'voice-player';
+
+  const btn = document.createElement('button');
+  btn.className = 'voice-btn';
+  btn.title = 'Play / pause';
+  btn.innerHTML = PLAY_SVG;
+
+  const barsEl = document.createElement('div');
+  barsEl.className = 'voice-bars';
+  const spans = wave.map((v) => {
+    const s = document.createElement('span');
+    s.style.height = Math.max(12, Math.min(100, v)) + '%';
+    barsEl.appendChild(s);
+    return s;
+  });
+
+  const timeEl = document.createElement('span');
+  timeEl.className = 'voice-time';
+  timeEl.textContent = fmtDur(totalDur);
+
+  wrap.append(btn, barsEl, timeEl);
+
+  let audio = null;
+  let raf = null;
+
+  const api = {
+    reset() {
+      btn.innerHTML = PLAY_SVG;
+      spans.forEach((s) => s.classList.remove('on'));
+      timeEl.textContent = fmtDur(totalDur);
+      if (raf) { cancelAnimationFrame(raf); raf = null; }
+    },
+  };
+
+  function paintProgress() {
+    if (!audio) return;
+    const dur = audio.duration && isFinite(audio.duration) ? audio.duration : totalDur;
+    const p = dur ? Math.min(1, audio.currentTime / dur) : 0;
+    const n = Math.round(p * spans.length);
+    spans.forEach((s, i) => s.classList.toggle('on', i < n));
+    timeEl.textContent = fmtDur(Math.max(0, dur - audio.currentTime));
+    if (audio.paused) { raf = null; return; }
+    raf = requestAnimationFrame(paintProgress);
+  }
+
+  btn.addEventListener('click', () => {
+    if (!audio) {
+      audio = new Audio(media.url);
+      audio.preload = 'metadata';
+      audio.addEventListener('ended', () => api.reset());
+    }
+    if (currentVoiceUI && currentVoiceUI !== api) stopCurrentVoice();
+    if (audio.paused) {
+      audio.play().then(() => {
+        currentAudio = audio;
+        currentVoiceUI = api;
+        btn.innerHTML = PAUSE_SVG;
+        if (!raf) raf = requestAnimationFrame(paintProgress);
+      }).catch(() => toast('Could not play this voice message'));
+    } else {
+      audio.pause();
+      btn.innerHTML = PLAY_SVG;
+      if (raf) { cancelAnimationFrame(raf); raf = null; }
+    }
+  });
+
+  return wrap;
+}
+
 function buildBubble(m, prev) {
   const out = m.from === state.me;
+  const meta = metaFor(m.convoId);
+  const isGroup = meta && meta.kind === 'group';
   const row = document.createElement('div');
   row.className = 'msg-row ' + (out ? 'out' : 'in');
 
@@ -409,23 +623,66 @@ function buildBubble(m, prev) {
   const newGroup = !prev || prev.from !== m.from || dateLabel(prev.ts) !== dateLabel(m.ts);
   bubble.className = 'bubble' + (newGroup ? ' tail' : '');
 
-  const text = document.createElement('span');
-  text.textContent = m.text;
-  bubble.appendChild(text);
+  if (!out && isGroup && newGroup) {
+    const sender = document.createElement('span');
+    sender.className = 'sender-name';
+    sender.textContent = m.from;
+    sender.style.color = avatarColor(m.from);
+    bubble.appendChild(sender);
+  }
 
-  const meta = document.createElement('span');
-  meta.className = 'meta';
-  meta.dataset.id = m.id;
+  if (m.kind === 'photo' && m.media) {
+    bubble.classList.add('photo-bubble');
+    const img = document.createElement('img');
+    img.className = 'photo-img';
+    img.src = m.media.url;
+    img.alt = m.media.name || 'Photo';
+    img.addEventListener('click', () => openLightbox(m.media.url));
+    bubble.appendChild(img);
+  }
+
+  if (m.kind === 'voice' && m.media) {
+    bubble.classList.add('voice-bubble');
+    bubble.appendChild(buildVoicePlayer(m));
+  }
+
+  const metaEl = document.createElement('span');
+  metaEl.className = 'meta';
+  metaEl.dataset.id = m.id;
   const t = document.createElement('span');
   t.textContent = timeHM(m.ts);
-  meta.appendChild(t);
+  metaEl.appendChild(t);
   if (out) {
     const ticks = document.createElement('span');
     ticks.className = 'ticks';
     ticks.innerHTML = tickSVG(m);
-    meta.appendChild(ticks);
+    metaEl.appendChild(ticks);
   }
-  bubble.appendChild(meta);
+
+  if (m.text) {
+    if (m.kind === 'photo') {
+      // caption under the photo, time floats right of the caption line
+      const capWrap = document.createElement('span');
+      capWrap.className = 'caption-wrap';
+      capWrap.appendChild(metaEl);
+      const cap = document.createElement('span');
+      cap.className = 'caption';
+      cap.textContent = m.text;
+      capWrap.appendChild(cap);
+      bubble.appendChild(capWrap);
+    } else {
+      const text = document.createElement('span');
+      text.textContent = m.text;
+      bubble.appendChild(text);
+      bubble.appendChild(metaEl);
+    }
+  } else {
+    bubble.appendChild(metaEl);
+    if (m.kind === 'photo') {
+      bubble.classList.add('no-caption');
+      metaEl.classList.add('overlay');
+    }
+  }
 
   row.appendChild(bubble);
   return row;
@@ -433,6 +690,7 @@ function buildBubble(m, prev) {
 
 function renderMessages(chat) {
   messagesEl.innerHTML = '';
+  typingRowEl = null;
   state.lastDateLabel = null;
   let prev = null;
   for (const m of chat.messages) {
@@ -472,9 +730,11 @@ function maybeScroll(m) {
 let typingRowEl = null;
 let typingTimer = null;
 
-function showTyping(from, isTyping) {
+function showTyping(convoId, from, isTyping) {
   if (isTyping) {
-    chatStatus.textContent = 'typing…';
+    const meta = metaFor(convoId);
+    const isGroup = meta && meta.kind === 'group';
+    chatStatus.textContent = isGroup ? `${from} is typing…` : 'typing…';
     chatStatus.className = 'chat-status typing';
     chatStatus.dataset.typing = '1';
     if (!typingRowEl) {
@@ -486,9 +746,9 @@ function showTyping(from, isTyping) {
     messagesEl.appendChild(typingRowEl);
     scrollBottom();
     clearTimeout(typingTimer);
-    typingTimer = setTimeout(() => clearTyping(from), 5000); // safety
+    typingTimer = setTimeout(() => clearTyping(convoId), 5000); // safety
   } else {
-    clearTyping(from);
+    clearTyping(convoId);
   }
 }
 
@@ -496,10 +756,10 @@ function removeTypingRow() {
   if (typingRowEl && typingRowEl.parentNode) typingRowEl.parentNode.removeChild(typingRowEl);
 }
 
-function clearTyping(from) {
+function clearTyping(convoId) {
   clearTimeout(typingTimer);
   removeTypingRow();
-  if (from === state.active) {
+  if (convoId === state.active) {
     delete chatStatus.dataset.typing;
     updateActiveHeader();
   }
@@ -518,7 +778,7 @@ function autoResize() {
 function sendMessage() {
   const text = msgInput.value.replace(/\s+$/, '');
   if (!text.trim() || !state.active) return;
-  wsSend({ type: 'message', to: state.active, text });
+  wsSend({ type: 'message', convoId: state.active, kind: 'text', text });
   msgInput.value = '';
   autoResize();
   sendTyping(false);
@@ -534,9 +794,6 @@ msgInput.addEventListener('keydown', (e) => {
   }
 });
 
-micBtn.addEventListener('click', () => toast('🎙️ Voice messages coming soon!'));
-attachBtn.addEventListener('click', () => toast('📎 Attachments coming soon!'));
-
 /* typing notifications (throttled) */
 let lastTypingSent = 0;
 let typingStopTimer = null;
@@ -545,16 +802,396 @@ function sendTyping(isTyping) {
   const now = Date.now();
   if (isTyping) {
     if (now - lastTypingSent > 1800) {
-      wsSend({ type: 'typing', to: state.active, isTyping: true });
+      wsSend({ type: 'typing', convoId: state.active, isTyping: true });
       lastTypingSent = now;
     }
     clearTimeout(typingStopTimer);
-    typingStopTimer = setTimeout(() => wsSend({ type: 'typing', to: state.active, isTyping: false }), 1800);
+    typingStopTimer = setTimeout(() => wsSend({ type: 'typing', convoId: state.active, isTyping: false }), 1800);
   } else {
     clearTimeout(typingStopTimer);
-    wsSend({ type: 'typing', to: state.active, isTyping: false });
+    wsSend({ type: 'typing', convoId: state.active, isTyping: false });
   }
 }
+
+/* ------------------------------ uploads (shared) --------------------------- */
+
+async function uploadDataUrl(dataUrl, name) {
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dataUrl, name }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.ok) throw new Error(j.error || 'Upload failed');
+  return j.url;
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error('Could not read file'));
+    r.readAsDataURL(blob);
+  });
+}
+
+function loadImageEl(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Could not read that image'));
+    img.src = src;
+  });
+}
+
+// Client-side resize via canvas (max dimension), JPEG output.
+async function resizeImage(file, maxDim, quality = 0.85) {
+  const objUrl = URL.createObjectURL(file);
+  try {
+    const img = await loadImageEl(objUrl);
+    const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas.toDataURL('image/jpeg', quality);
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+/* ------------------------------ photo sharing ------------------------------ */
+
+const photoInput = $('photoInput');
+const photoModal = $('photoModal');
+const photoPreview = $('photoPreview');
+const photoCaption = $('photoCaption');
+const photoCancelBtn = $('photoCancelBtn');
+const photoSendBtn = $('photoSendBtn');
+const photoCloseBtn = $('photoCloseBtn');
+const lightbox = $('lightbox');
+const lightboxImg = $('lightboxImg');
+
+let pendingPhoto = null; // {dataUrl, name, w, h}
+
+attachBtn.addEventListener('click', () => {
+  if (!state.active) return;
+  photoInput.click();
+});
+
+photoInput.addEventListener('change', async () => {
+  const file = photoInput.files && photoInput.files[0];
+  photoInput.value = '';
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please choose an image'); return; }
+  try {
+    const dataUrl = await resizeImage(file, 1280, 0.85);
+    const img = await loadImageEl(dataUrl);
+    pendingPhoto = { dataUrl, name: file.name || 'photo.jpg', w: img.naturalWidth, h: img.naturalHeight };
+    photoPreview.src = dataUrl;
+    photoCaption.value = '';
+    photoModal.classList.remove('hidden');
+    photoCaption.focus();
+  } catch (err) {
+    toast(err.message || 'Could not read that image');
+  }
+});
+
+function closePhotoModal() {
+  photoModal.classList.add('hidden');
+  pendingPhoto = null;
+  photoSendBtn.disabled = false;
+}
+
+photoCancelBtn.addEventListener('click', closePhotoModal);
+photoCloseBtn.addEventListener('click', closePhotoModal);
+
+photoSendBtn.addEventListener('click', async () => {
+  if (!pendingPhoto || !state.active) return;
+  const caption = photoCaption.value.trim();
+  photoSendBtn.disabled = true;
+  try {
+    const url = await uploadDataUrl(pendingPhoto.dataUrl, pendingPhoto.name);
+    wsSend({
+      type: 'message',
+      convoId: state.active,
+      kind: 'photo',
+      text: caption,
+      media: { url, w: pendingPhoto.w, h: pendingPhoto.h, name: pendingPhoto.name },
+    });
+    closePhotoModal();
+  } catch (err) {
+    toast(err.message || 'Upload failed');
+    photoSendBtn.disabled = false;
+  }
+});
+
+function openLightbox(url) {
+  lightboxImg.src = url;
+  lightbox.classList.remove('hidden');
+}
+lightbox.addEventListener('click', () => {
+  lightbox.classList.add('hidden');
+  lightboxImg.src = '';
+});
+
+/* ------------------------------ voice messages ----------------------------- */
+
+const recordingBar = $('recordingBar');
+const composerBar = $('composerBar');
+const recTimeEl = $('recTime');
+const recCancelBtn = $('recCancelBtn');
+const recSendBtn = $('recSendBtn');
+
+const rec = { recorder: null, stream: null, chunks: [], cancelled: false, started: 0, timer: null, mime: '' };
+
+function pickRecMime() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  for (const mt of candidates) {
+    try { if (MediaRecorder.isTypeSupported(mt)) return mt; } catch { /* keep trying */ }
+  }
+  return '';
+}
+
+function mimeExt(mime) {
+  if (!mime) return '.webm';
+  if (mime.includes('mp4') || mime.includes('aac') || mime.includes('m4a')) return '.m4a';
+  if (mime.includes('ogg')) return '.ogg';
+  if (mime.includes('mpeg') || mime.includes('mp3')) return '.mp3';
+  if (mime.includes('wav')) return '.wav';
+  return '.webm';
+}
+
+async function startRecording() {
+  if (state.recording || !state.active) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+    toast('Voice messages are not supported in this browser');
+    return;
+  }
+  try {
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    toast('Microphone permission denied');
+    return;
+  }
+  rec.mime = pickRecMime();
+  try {
+    rec.recorder = rec.mime ? new MediaRecorder(rec.stream, { mimeType: rec.mime }) : new MediaRecorder(rec.stream);
+  } catch {
+    rec.recorder = new MediaRecorder(rec.stream);
+    rec.mime = rec.recorder.mimeType || '';
+  }
+  rec.chunks = [];
+  rec.cancelled = false;
+  rec.started = Date.now();
+  rec.recorder.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  rec.recorder.onstop = onRecStop;
+  rec.recorder.start(250);
+  state.recording = true;
+  composerBar.classList.add('hidden');
+  recordingBar.classList.remove('hidden');
+  recTimeEl.textContent = '0:00';
+  clearInterval(rec.timer);
+  rec.timer = setInterval(() => {
+    recTimeEl.textContent = fmtDur((Date.now() - rec.started) / 1000);
+  }, 200);
+}
+
+function stopRecording(sendIt) {
+  if (!state.recording) return;
+  rec.cancelled = !sendIt;
+  clearInterval(rec.timer);
+  try {
+    if (rec.recorder && rec.recorder.state !== 'inactive') rec.recorder.stop();
+  } catch { /* already stopped */ }
+  if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop());
+  state.recording = false;
+  recordingBar.classList.add('hidden');
+  composerBar.classList.remove('hidden');
+}
+
+// 40 RMS bars from the decoded audio, normalised 0-100.
+async function computeWave(blob) {
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const buf = await ac.decodeAudioData(await blob.arrayBuffer());
+    const data = buf.getChannelData(0);
+    const N = 40;
+    const block = Math.max(1, Math.floor(data.length / N));
+    const raw = [];
+    let max = 0;
+    for (let i = 0; i < N; i++) {
+      let sum = 0;
+      const start = i * block;
+      for (let j = 0; j < block; j++) {
+        const v = data[start + j] || 0;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / block);
+      raw.push(rms);
+      max = Math.max(max, rms);
+    }
+    const wave = raw.map((v) => Math.max(6, Math.round((v / (max || 1)) * 100)));
+    return { wave, duration: buf.duration || (Date.now() - rec.started) / 1000 };
+  } finally {
+    if (ac.close) ac.close().catch(() => {});
+  }
+}
+
+async function onRecStop() {
+  const blob = new Blob(rec.chunks, { type: rec.mime || (rec.recorder && rec.recorder.mimeType) || 'audio/webm' });
+  rec.chunks = [];
+  if (rec.cancelled) return;
+  if (blob.size < 800) { toast('Recording too short'); return; }
+  let wave, duration;
+  try {
+    ({ wave, duration } = await computeWave(blob));
+  } catch {
+    wave = Array.from({ length: 40 }, () => 30);
+    duration = (Date.now() - rec.started) / 1000;
+  }
+  try {
+    const url = await uploadDataUrl(await blobToDataUrl(blob), `voice-note${mimeExt(blob.type)}`);
+    if (!state.active) return;
+    wsSend({
+      type: 'message',
+      convoId: state.active,
+      kind: 'voice',
+      text: '',
+      media: { url, duration: Math.round(duration * 10) / 10, wave },
+    });
+  } catch (err) {
+    toast(err.message || 'Upload failed');
+  }
+}
+
+micBtn.addEventListener('click', startRecording);
+recCancelBtn.addEventListener('click', () => stopRecording(false));
+recSendBtn.addEventListener('click', () => stopRecording(true));
+
+/* ------------------------------ profile picture ---------------------------- */
+
+const avatarInput = $('avatarInput');
+
+myAvatarWrap.addEventListener('click', () => avatarInput.click());
+avatarInput.addEventListener('change', async () => {
+  const file = avatarInput.files && avatarInput.files[0];
+  avatarInput.value = '';
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please choose an image'); return; }
+  try {
+    const dataUrl = await resizeImage(file, 256, 0.85);
+    const url = await uploadDataUrl(dataUrl, 'profile-pic.jpg');
+    wsSend({ type: 'profile_set', pic: url });
+  } catch (err) {
+    toast(err.message || 'Upload failed');
+  }
+});
+
+/* ------------------------------ new group modal ---------------------------- */
+
+const groupModal = $('groupModal');
+const groupCloseBtn = $('groupCloseBtn');
+const groupCancelBtn = $('groupCancelBtn');
+const groupCreateBtn = $('groupCreateBtn');
+const groupNameInput = $('groupNameInput');
+const groupMembersEl = $('groupMembers');
+const groupPicWrap = $('groupPicWrap');
+const groupPicIcon = $('groupPicIcon');
+const groupPicInput = $('groupPicInput');
+
+let groupPicDraft = null; // resized dataURL, uploaded on create
+
+newGroupBtn.addEventListener('click', openGroupModal);
+groupCloseBtn.addEventListener('click', closeGroupModal);
+groupCancelBtn.addEventListener('click', closeGroupModal);
+
+function openGroupModal() {
+  groupNameInput.value = '';
+  groupPicDraft = null;
+  groupPicWrap.style.backgroundImage = '';
+  groupPicWrap.style.background = 'var(--accent-dark)';
+  groupPicIcon.classList.remove('hidden');
+  groupCreateBtn.disabled = false;
+
+  groupMembersEl.innerHTML = '';
+  for (const u of state.users) {
+    if (u.name === state.me) continue;
+    const row = document.createElement('label');
+    row.className = 'gm-member';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = u.name;
+
+    const av = document.createElement('div');
+    av.className = 'avatar';
+    applyAvatar(av, u.name, u.pic);
+
+    const nameEl = document.createElement('span');
+    nameEl.textContent = u.name;
+    if (u.bot) {
+      const tag = document.createElement('span');
+      tag.className = 'bot-tag';
+      tag.textContent = 'BOT';
+      nameEl.appendChild(tag);
+    }
+
+    const status = document.createElement('span');
+    status.className = 'gm-status';
+    status.textContent = u.online ? 'online' : 'offline';
+
+    row.append(cb, av, nameEl, status);
+    groupMembersEl.appendChild(row);
+  }
+  groupModal.classList.remove('hidden');
+  groupNameInput.focus();
+}
+
+function closeGroupModal() {
+  groupModal.classList.add('hidden');
+  groupPicDraft = null;
+  groupCreateBtn.disabled = false;
+}
+
+groupPicWrap.addEventListener('click', () => groupPicInput.click());
+groupPicInput.addEventListener('change', async () => {
+  const file = groupPicInput.files && groupPicInput.files[0];
+  groupPicInput.value = '';
+  if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please choose an image'); return; }
+  try {
+    groupPicDraft = await resizeImage(file, 256, 0.85);
+    groupPicWrap.style.backgroundImage = `url("${groupPicDraft}")`;
+    groupPicIcon.classList.add('hidden');
+  } catch (err) {
+    toast(err.message || 'Could not read that image');
+  }
+});
+
+groupCreateBtn.addEventListener('click', async () => {
+  const name = groupNameInput.value.trim();
+  if (!name) { toast('Please enter a group name'); groupNameInput.focus(); return; }
+  const members = [...groupMembersEl.querySelectorAll('input[type="checkbox"]:checked')].map((cb) => cb.value);
+  if (!members.length) { toast('Add at least one member'); return; }
+  groupCreateBtn.disabled = true;
+  try {
+    let pic = null;
+    if (groupPicDraft) pic = await uploadDataUrl(groupPicDraft, 'group-pic.jpg');
+    wsSend({ type: 'group_create', name, members, pic });
+    // modal closes when the server echoes group_created
+    setTimeout(() => { groupCreateBtn.disabled = false; }, 3000);
+  } catch (err) {
+    toast(err.message || 'Upload failed');
+    groupCreateBtn.disabled = false;
+  }
+});
 
 /* ------------------------------ emoji panel -------------------------------- */
 
@@ -601,6 +1238,17 @@ logoutBtn.addEventListener('click', () => {
 
 backBtn.addEventListener('click', () => document.body.classList.remove('chat-open'));
 
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (!lightbox.classList.contains('hidden')) {
+      lightbox.classList.add('hidden');
+      lightboxImg.src = '';
+    }
+    closePhotoModal();
+    closeGroupModal();
+  }
+});
+
 /* ------------------------------ misc --------------------------------------- */
 
 function updateTitleBadge() {
@@ -617,7 +1265,7 @@ window.addEventListener('focus', () => {
       renderChatList();
       updateTitleBadge();
     }
-    wsSend({ type: 'read', with: state.active });
+    wsSend({ type: 'read', convoId: state.active });
   }
 });
 

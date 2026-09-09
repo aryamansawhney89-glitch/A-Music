@@ -2,22 +2,30 @@
 
 /**
  * A-Chat — WhatsApp-style realtime chat server.
- * Express serves the static client; a WebSocket endpoint routes messages
- * between users, tracks typing / delivered / read state, and runs a few
- * demo bots so the app is fun with a single user. History is persisted
- * to data/messages.json so conversations survive restarts.
+ *
+ * Express serves the static client and the /uploads folder; a WebSocket
+ * endpoint routes everything by conversation id:
+ *   - dm::A::B   two participants (names sorted, joined with "::")
+ *   - grp::<id>  a group chat
+ * Messages, groups and user profiles are persisted as JSON files in data/
+ * (messages.json, groups.json, users.json); media uploads land in data/uploads.
  */
 
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'messages.json');
-const MAX_HISTORY = 500; // per conversation
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const MAX_HISTORY = 500;                  // per conversation
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8 MB decoded cap for /api/upload
 
 /* ---------------------------------- bots ---------------------------------- */
 
@@ -31,7 +39,16 @@ const BOTS = [
         'Hi {u}! Great to see you on A-Chat 💬',
       ] },
       { keys: ['help', 'feature', 'how'], replies: [
-        'Here is what A-Chat can do: realtime messaging, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle in the sidebar. Tip: open A-Chat in a second tab with a different name and chat with yourself live!',
+        'Here is what A-Chat can do: realtime messaging, group chats 👥, photo sharing 📸, voice notes 🎙️, profile pictures 👤, read receipts ✓✓, typing indicators, emoji 😄 and a dark mode toggle 🌙. Tip: use the 👥 button in the sidebar to create a group!',
+      ] },
+      { keys: ['group', 'invite'], replies: [
+        'Groups are here! 👥 Tap the 👥 button in the sidebar, pick a name, a picture (optional) and tick the members you want.',
+      ] },
+      { keys: ['photo', 'picture', 'image'], replies: [
+        'You can send photos! 📸 Tap the 📎 button in any chat — you can add a caption before sending.',
+      ] },
+      { keys: ['voice', 'record', 'audio'], replies: [
+        'Voice notes work too! 🎙️ Tap the 🎤 in a chat, record, then hit the send arrow — the bubble even shows a waveform.',
       ] },
       { keys: ['music', 'song', 'play', 'playlist'], replies: [
         'For tunes, our resident DJ is the one to ask — say "play" to DJ Nova 🎧',
@@ -86,6 +103,52 @@ const BOTS = [
   },
 ];
 
+const BOT_AVATARS = {
+  'Aria': '/avatars/aria.svg',
+  'Max': '/avatars/max.svg',
+  'DJ Nova': '/avatars/dj-nova.svg',
+};
+
+// Reactions to media messages, per bot personality.
+const MEDIA_REPLIES = {
+  'Aria': {
+    photo: [
+      'Nice picture! 📸 Thanks for sharing.',
+      'Photo received — looks great! 🖼️',
+      '📸 Lovely! A-Chat picture messages in action.',
+    ],
+    voice: [
+      'Got your voice note! 🎙️ It plays right inside the chat bubble.',
+      'I heard you loud and clear! 🔊',
+      'Voice message received — loving that waveform 🎚️',
+    ],
+  },
+  'Max': {
+    photo: [
+      'yo nice pic 😄📸',
+      'lmaooo what a shot 😂',
+      'ok that\'s a good one 🔥',
+    ],
+    voice: [
+      'bro. your voice note 😂🎙️',
+      'ok ok I listened, iconic 🔊',
+      'voice notes?? we fancy fancy 🎙️✨',
+    ],
+  },
+  'DJ Nova': {
+    photo: [
+      '📸 That image deserves a soundtrack — say "play" and I\'ll pick one.',
+      'Nice shot! Every moment needs a theme song 🎶',
+    ],
+    voice: [
+      '🎙️ Voice note detected — instant remix potential. Say "play" for a track!',
+      'Your voice has rhythm 🎶 — let\'s find it a beat. Say "play"!',
+    ],
+  },
+};
+
+const isBot = (name) => BOTS.some((b) => b.name === name);
+
 function pickBotReply(bot, userName, text) {
   const t = text.toLowerCase();
   for (const rule of bot.rules) {
@@ -96,42 +159,116 @@ function pickBotReply(bot, userName, text) {
   return bot.fallback[Math.floor(Math.random() * bot.fallback.length)].replaceAll('{u}', userName);
 }
 
+function pickMediaReply(botName, kind) {
+  const set = MEDIA_REPLIES[botName];
+  if (!set || !set[kind]) return null;
+  return set[kind][Math.floor(Math.random() * set[kind].length)];
+}
+
 /* ---------------------------------- state --------------------------------- */
 
 const clients = new Map();       // name -> ws
 const lastSeen = new Map();      // name -> ts (also lists offline users)
-const conversations = new Map(); // convoKey -> message[]
+const conversations = new Map(); // convoId -> message[]
+const groups = new Map();        // grp::<id> -> {id, name, pic, members, createdBy, createdAt}
+const profiles = new Map();      // name -> {name, pic, about}
 let nextId = 1;
 
-function convoKey(a, b) {
-  return [a, b].sort().join('::');
+const dmConvoId = (a, b) => `dm::${[a, b].sort().join('::')}`;
+const newGroupId = () => `grp::${crypto.randomBytes(4).toString('hex')}`;
+
+function convoParticipants(convoId) {
+  if (typeof convoId !== 'string') return [];
+  if (convoId.startsWith('dm::')) return convoId.slice(4).split('::').filter(Boolean);
+  if (convoId.startsWith('grp::')) {
+    const g = groups.get(convoId);
+    return g ? [...g.members] : [];
+  }
+  return [];
 }
 
-/* ------------------------------- persistence ------------------------------ */
+function canAccess(convoId, name) {
+  return !!name && convoParticipants(convoId).includes(name);
+}
 
-try {
-  const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  for (const [key, msgs] of Object.entries(raw)) {
-    if (Array.isArray(msgs) && msgs.length) conversations.set(key, msgs);
+/* ------------------------------ persistence ------------------------------- */
+
+function normalizeConvoId(key) {
+  if (key.startsWith('dm::') || key.startsWith('grp::')) return key;
+  // legacy "A::B" keys from before convoId routing
+  return `dm::${key.split('::').filter(Boolean).sort().join('::')}`;
+}
+
+function migrateMessage(m, convoId) {
+  if (!m || !m.from) return null;
+  const others = convoParticipants(convoId).filter((p) => p !== m.from);
+  return {
+    id: m.id,
+    convoId,
+    from: m.from,
+    kind: m.kind || 'text',
+    text: m.text || '',
+    media: m.media || null,
+    ts: m.ts || Date.now(),
+    deliveredBy: Array.isArray(m.deliveredBy) ? m.deliveredBy : (m.delivered ? others : []),
+    readBy: Array.isArray(m.readBy) ? m.readBy : (m.read ? others : []),
+  };
+}
+
+function loadState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8'));
+    for (const [key, msgs] of Object.entries(raw)) {
+      if (!Array.isArray(msgs) || !msgs.length) continue;
+      const convoId = normalizeConvoId(key);
+      const migrated = msgs.map((m) => migrateMessage(m, convoId)).filter(Boolean);
+      if (migrated.length) conversations.set(convoId, migrated);
+    }
+  } catch { /* first run — no history yet */ }
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(GROUPS_FILE, 'utf8'));
+    for (const g of raw) {
+      if (g && g.id && g.name && Array.isArray(g.members)) groups.set(g.id, g);
+    }
+  } catch { /* no groups yet */ }
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    for (const [name, p] of Object.entries(raw)) {
+      if (p && typeof p === 'object') {
+        profiles.set(name, { name, pic: p.pic || null, about: p.about || '' });
+      }
+    }
+  } catch { /* no profiles yet */ }
+
+  // make sure the bots always have their avatars + about text
+  for (const b of BOTS) {
+    const existing = profiles.get(b.name);
+    if (!existing) profiles.set(b.name, { name: b.name, pic: BOT_AVATARS[b.name], about: b.subtitle });
+    else if (!existing.pic) existing.pic = BOT_AVATARS[b.name];
   }
+
   const all = [...conversations.values()].flat();
   if (all.length) nextId = Math.max(...all.map((m) => m.id || 0)) + 1;
-  console.log(`Loaded ${all.length} messages from disk.`);
-} catch {
-  /* first run — no history yet */
+  if (all.length) console.log(`Loaded ${all.length} messages, ${groups.size} groups, ${profiles.size} profiles from disk.`);
 }
 
 let saveTimer = null;
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(DATA_FILE, JSON.stringify(Object.fromEntries(conversations)));
-    } catch (err) {
-      console.error('Save failed:', err.message);
-    }
-  }, 400);
+  saveTimer = setTimeout(saveAll, 400);
+}
+
+function saveAll() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(MESSAGES_FILE, JSON.stringify(Object.fromEntries(conversations)));
+    fs.writeFileSync(GROUPS_FILE, JSON.stringify([...groups.values()]));
+    fs.writeFileSync(USERS_FILE, JSON.stringify(Object.fromEntries(profiles)));
+  } catch (err) {
+    console.error('Save failed:', err.message);
+  }
 }
 
 /* --------------------------------- helpers -------------------------------- */
@@ -140,23 +277,51 @@ function send(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 }
 
-function pushMessage(msg) {
-  const key = convoKey(msg.from, msg.to);
-  if (!conversations.has(key)) conversations.set(key, []);
-  const arr = conversations.get(key);
-  arr.push(msg);
+function pushMessage(m) {
+  if (!conversations.has(m.convoId)) conversations.set(m.convoId, []);
+  const arr = conversations.get(m.convoId);
+  arr.push(m);
   if (arr.length > MAX_HISTORY) arr.splice(0, arr.length - MAX_HISTORY);
   scheduleSave();
 }
 
-function userList() {
-  const humans = [...lastSeen.keys()].map((name) => ({
+function notifyStatus(m) {
+  send(clients.get(m.from), {
+    type: 'status', id: m.id, convoId: m.convoId, deliveredBy: m.deliveredBy, readBy: m.readBy,
+  });
+}
+
+function markDeliveredFor(name) {
+  let changed = false;
+  for (const msgs of conversations.values()) {
+    for (const m of msgs) {
+      if (m.from !== name && canAccess(m.convoId, name) && !m.deliveredBy.includes(name)) {
+        m.deliveredBy.push(name);
+        changed = true;
+        notifyStatus(m);
+      }
+    }
+  }
+  if (changed) scheduleSave();
+}
+
+function userInfo(name) {
+  const p = profiles.get(name) || {};
+  const online = clients.has(name);
+  return {
     name,
-    online: clients.has(name),
-    bot: false,
-    lastSeen: clients.has(name) ? null : lastSeen.get(name),
-  }));
-  const bots = BOTS.map((b) => ({ name: b.name, online: true, bot: true, lastSeen: null }));
+    online,
+    bot: isBot(name),
+    lastSeen: online ? null : lastSeen.get(name) || null,
+    pic: p.pic || null,
+    about: p.about || '',
+  };
+}
+
+function userList() {
+  const known = new Set([...lastSeen.keys(), ...profiles.keys()]);
+  const humans = [...known].filter((n) => !isBot(n)).map(userInfo);
+  const bots = BOTS.map((b) => userInfo(b.name));
   return [...bots, ...humans];
 }
 
@@ -167,47 +332,84 @@ function broadcastUsers() {
   }
 }
 
-function notifyStatus(m) {
-  send(clients.get(m.from), {
-    type: 'status', id: m.id, with: m.to, delivered: m.delivered, read: m.read,
-  });
+function groupsForUser(name) {
+  return [...groups.values()].filter((g) => g.members.includes(name));
 }
 
-function markDeliveredFor(name) {
-  let changed = false;
-  for (const msgs of conversations.values()) {
-    for (const m of msgs) {
-      if (m.to === name && !m.delivered) {
-        m.delivered = true;
-        changed = true;
-        notifyStatus(m);
-      }
-    }
+function broadcastGroups() {
+  for (const [name, ws] of clients) {
+    send(ws, { type: 'groups', groups: groupsForUser(name) });
   }
-  if (changed) scheduleSave();
 }
 
-function botSay(botName, to, text) {
+const PIC_RE = /^\/(uploads|avatars)\/[A-Za-z0-9._-]+$/;
+function sanitizePic(pic) {
+  return typeof pic === 'string' && PIC_RE.test(pic) ? pic : null;
+}
+
+function sanitizeMedia(media, kind) {
+  if (kind === 'text') return null;
+  if (!media || typeof media !== 'object') return null;
+  const url = typeof media.url === 'string' ? media.url : '';
+  if (!PIC_RE.test(url) || !url.startsWith('/uploads/')) return null;
+  const out = { url };
+  if (media.name) out.name = String(media.name).slice(0, 120);
+  if (Number.isFinite(media.w)) out.w = Math.max(0, Math.round(media.w));
+  if (Number.isFinite(media.h)) out.h = Math.max(0, Math.round(media.h));
+  if (Number.isFinite(media.duration)) out.duration = Math.min(600, Math.max(0, Math.round(media.duration * 10) / 10));
+  if (Array.isArray(media.wave)) {
+    out.wave = media.wave.slice(0, 40).map((v) => Math.max(0, Math.min(100, Math.round(Number(v) || 0))));
+  }
+  return out;
+}
+
+/* ---------------------------------- bots ---------------------------------- */
+
+function botSay(convoId, botName, text) {
   const m = {
-    id: nextId++, from: botName, to, text, ts: Date.now(),
-    delivered: clients.has(to), read: false,
+    id: nextId++, convoId, from: botName, kind: 'text', text,
+    media: null, ts: Date.now(), deliveredBy: [], readBy: [],
   };
+  for (const p of convoParticipants(convoId)) {
+    if (p === botName) continue;
+    if (isBot(p)) { m.deliveredBy.push(p); m.readBy.push(p); }
+    else if (clients.has(p)) m.deliveredBy.push(p);
+  }
   pushMessage(m);
-  send(clients.get(to), { type: 'message', message: m });
+  for (const p of convoParticipants(convoId)) {
+    if (p !== botName && !isBot(p)) send(clients.get(p), { type: 'message', message: m });
+  }
 }
 
-function scheduleBotReply(botName, userName, userText) {
-  const bot = BOTS.find((b) => b.name === botName);
-  if (!bot) return;
-  const reply = pickBotReply(bot, userName, userText);
-  const thinkMs = 500 + Math.min(2500, reply.length * 45) + Math.random() * 500;
+function scheduleBotReply(botName, convoId, fromName, replyText) {
+  const thinkMs = 500 + Math.min(2500, replyText.length * 45) + Math.random() * 500;
   setTimeout(() => {
-    send(clients.get(userName), { type: 'typing', from: botName, isTyping: true });
+    for (const p of convoParticipants(convoId)) {
+      if (p !== botName && !isBot(p)) send(clients.get(p), { type: 'typing', convoId, from: botName, isTyping: true });
+    }
     setTimeout(() => {
-      send(clients.get(userName), { type: 'typing', from: botName, isTyping: false });
-      botSay(botName, userName, reply);
+      for (const p of convoParticipants(convoId)) {
+        if (p !== botName && !isBot(p)) send(clients.get(p), { type: 'typing', convoId, from: botName, isTyping: false });
+      }
+      botSay(convoId, botName, replyText);
     }, thinkMs);
   }, 450);
+}
+
+// Bots always answer DMs; in groups they react to photos/voice notes and
+// when someone mentions them by name.
+function maybeBotReact(convoId, m) {
+  const text = (m.text || '').toLowerCase();
+  for (const p of convoParticipants(convoId)) {
+    if (p === m.from || !isBot(p)) continue;
+    const mentioned = text.includes(p.toLowerCase()) || text.includes('@' + p.toLowerCase());
+    if (!convoId.startsWith('dm::') && m.kind === 'text' && !mentioned) continue;
+    const bot = BOTS.find((b) => b.name === p);
+    const reply = (m.kind === 'photo' || m.kind === 'voice')
+      ? (pickMediaReply(p, m.kind) || pickBotReply(bot, m.from, m.text || ''))
+      : pickBotReply(bot, m.from, m.text || '');
+    scheduleBotReply(p, convoId, m.from, reply);
+  }
 }
 
 /* ------------------------------ message router ---------------------------- */
@@ -217,7 +419,7 @@ function handle(ws, msg) {
     case 'join': {
       let name = String(msg.name || '').trim().replace(/\s+/g, ' ').slice(0, 24);
       if (!name) name = 'Guest-' + Math.floor(Math.random() * 1000);
-      if (BOTS.some((b) => b.name.toLowerCase() === name.toLowerCase())) name = name + ' (you)';
+      if (isBot(name)) name = name + ' (you)';
       const existing = clients.get(name);
       if (existing && existing !== ws) {
         send(existing, { type: 'kicked', reason: 'You signed in from another tab.' });
@@ -226,15 +428,19 @@ function handle(ws, msg) {
       ws.userName = name;
       clients.set(name, ws);
       lastSeen.set(name, Date.now());
-      send(ws, { type: 'joined', name, users: userList() });
+      if (!profiles.has(name)) {
+        profiles.set(name, { name, pic: null, about: '' });
+        scheduleSave();
+      }
+      send(ws, { type: 'joined', name, users: userList(), groups: groupsForUser(name) });
       broadcastUsers();
       markDeliveredFor(name);
-      const key = convoKey(name, 'Aria');
+      const key = dmConvoId(name, 'Aria');
       if (!conversations.has(key) || conversations.get(key).length === 0) {
         setTimeout(() => {
           if (clients.has(name)) {
-            botSay('Aria', name,
-              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact on the left to start chatting — or open this app in a second tab with a different name to chat live between users.`);
+            botSay(key, 'Aria',
+              `Welcome to A-Chat, ${name}! 🎉 I'm Aria, the demo assistant. Pick any contact to chat, use 👥 in the sidebar to create a group, and try sharing a photo 📸 or voice note 🎙️. Type "help" to see everything.`);
           }
         }, 1200);
       }
@@ -244,45 +450,70 @@ function handle(ws, msg) {
     case 'message': {
       const from = ws.userName;
       if (!from) return;
-      const to = String(msg.to || '').slice(0, 64);
+      const convoId = String(msg.convoId || '');
+      const kind = ['text', 'photo', 'voice'].includes(msg.kind) ? msg.kind : 'text';
       const text = String(msg.text || '').slice(0, 4000);
-      if (!to || !text.trim()) return;
-      const isBot = BOTS.some((b) => b.name === to);
-      const m = { id: nextId++, from, to, text, ts: Date.now(), delivered: false, read: false };
+      const media = sanitizeMedia(msg.media, kind);
+      if (!canAccess(convoId, from)) return;
+      if (kind === 'text' && !text.trim()) return;
+      if (kind !== 'text' && !media) return;
+      const m = {
+        id: nextId++, convoId, from, kind, text, media, ts: Date.now(),
+        deliveredBy: [], readBy: [],
+      };
       pushMessage(m);
       send(ws, { type: 'message', message: m }); // echo to sender (assigns id/ts)
-      const target = clients.get(to);
-      if (target && target.readyState === WebSocket.OPEN) {
-        m.delivered = true;
-        send(target, { type: 'message', message: m });
+      const participants = convoParticipants(convoId);
+      let changed = false;
+      // bots "read" instantly — mark them first so every copy of the message
+      // (including those sent to humans) already carries their receipts
+      for (const p of participants) {
+        if (p !== from && isBot(p)) {
+          m.deliveredBy.push(p);
+          m.readBy.push(p);
+          changed = true;
+        }
+      }
+      for (const p of participants) {
+        if (p === from || isBot(p)) continue;
+        const target = clients.get(p);
+        if (target && target.readyState === WebSocket.OPEN) {
+          m.deliveredBy.push(p);
+          changed = true;
+          send(target, { type: 'message', message: m });
+        }
+      }
+      if (changed) {
         notifyStatus(m);
         scheduleSave();
       }
-      if (isBot) {
-        m.delivered = true;
-        m.read = true;
-        notifyStatus(m);
-        scheduleBotReply(to, from, text);
-      }
+      maybeBotReact(convoId, m);
       break;
     }
 
     case 'typing': {
-      const to = clients.get(String(msg.to || ''));
-      send(to, { type: 'typing', from: ws.userName, isTyping: !!msg.isTyping });
+      const from = ws.userName;
+      const convoId = String(msg.convoId || '');
+      if (!from || !canAccess(convoId, from)) return;
+      for (const p of convoParticipants(convoId)) {
+        if (p !== from && !isBot(p)) {
+          send(clients.get(p), { type: 'typing', convoId, from, isTyping: !!msg.isTyping });
+        }
+      }
       break;
     }
 
     case 'read': {
       const me = ws.userName;
-      const other = String(msg.with || '');
-      const msgs = conversations.get(convoKey(me, other)) || [];
+      const convoId = String(msg.convoId || '');
+      if (!me || !canAccess(convoId, me)) return;
+      const msgs = conversations.get(convoId) || [];
       let changed = false;
       for (const m of msgs) {
-        if (m.to === me && !m.read) {
-          m.read = true;
+        if (m.from !== me && !m.readBy.includes(me)) {
+          m.readBy.push(me);
           changed = true;
-          send(clients.get(m.from), { type: 'read', id: m.id, by: me });
+          notifyStatus(m);
         }
       }
       if (changed) scheduleSave();
@@ -291,9 +522,59 @@ function handle(ws, msg) {
 
     case 'history': {
       const me = ws.userName;
-      const other = String(msg.with || '');
+      const convoId = String(msg.convoId || '');
+      if (!me || !canAccess(convoId, me)) {
+        send(ws, { type: 'history', convoId, messages: [] });
+        return;
+      }
       markDeliveredFor(me);
-      send(ws, { type: 'history', with: other, messages: conversations.get(convoKey(me, other)) || [] });
+      send(ws, { type: 'history', convoId, messages: conversations.get(convoId) || [] });
+      break;
+    }
+
+    case 'group_create': {
+      const from = ws.userName;
+      if (!from) return;
+      const name = String(msg.name || '').trim().slice(0, 50);
+      if (!name) {
+        send(ws, { type: 'error', error: 'Group name is required.' });
+        return;
+      }
+      const requested = Array.isArray(msg.members) ? msg.members : [];
+      const members = [...new Set([
+        from,
+        ...requested.map((n) => String(n).trim().slice(0, 24)),
+      ])].filter((n) => n === from || isBot(n) || profiles.has(n));
+      const group = {
+        id: newGroupId(),
+        name,
+        pic: sanitizePic(msg.pic),
+        members,
+        createdBy: from,
+        createdAt: Date.now(),
+      };
+      groups.set(group.id, group);
+      scheduleSave();
+      send(ws, { type: 'group_created', group });
+      broadcastGroups();
+      break;
+    }
+
+    case 'profile_set': {
+      const from = ws.userName;
+      if (!from) return;
+      if (!('pic' in msg)) return;
+      const pic = msg.pic === null ? null : sanitizePic(msg.pic);
+      if (msg.pic !== null && msg.pic !== undefined && !pic) {
+        send(ws, { type: 'error', error: 'Invalid profile picture.' });
+        return;
+      }
+      const p = profiles.get(from) || { name: from, pic: null, about: '' };
+      p.pic = pic;
+      profiles.set(from, p);
+      scheduleSave();
+      send(ws, { type: 'profile_saved', pic });
+      broadcastUsers();
       break;
     }
   }
@@ -303,7 +584,68 @@ function handle(ws, msg) {
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '1d' }));
 app.get('/healthz', (_req, res) => res.json({ ok: true, users: clients.size }));
+
+const UPLOAD_TYPES = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'audio/webm': '.webm',
+  'audio/ogg': '.ogg',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/aac': '.aac',
+  'audio/wav': '.wav',
+  'audio/x-wav': '.wav',
+};
+
+const uploadJson = express.json({ limit: '14mb' }); // 8MB binary ≈ 10.7MB base64
+
+app.post('/api/upload', uploadJson, (req, res) => {
+  const { dataUrl, name } = req.body || {};
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
+    return res.status(400).json({ ok: false, error: 'dataUrl (base64 data URL) is required.' });
+  }
+  const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
+  if (!match) {
+    return res.status(400).json({ ok: false, error: 'Only base64 data URLs are accepted.' });
+  }
+  const mime = match[1].toLowerCase();
+  const ext = UPLOAD_TYPES[mime];
+  if (!ext) {
+    return res.status(415).json({ ok: false, error: `Unsupported media type: ${mime}` });
+  }
+  const buf = Buffer.from(match[2], 'base64');
+  if (!buf.length) {
+    return res.status(400).json({ ok: false, error: 'Empty upload.' });
+  }
+  if (buf.length > MAX_UPLOAD_BYTES) {
+    return res.status(413).json({ ok: false, error: 'File too large (8MB max).' });
+  }
+  try {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    const filename = Date.now().toString(36) + '-' + crypto.randomBytes(6).toString('hex') + ext;
+    fs.writeFileSync(path.join(UPLOADS_DIR, filename), buf);
+    res.json({ ok: true, url: `/uploads/${filename}`, size: buf.length, type: mime, name: String(name || '').slice(0, 120) });
+  } catch (err) {
+    console.error('Upload failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Upload failed.' });
+  }
+});
+
+// JSON body errors (oversized payloads etc.) → clean JSON responses
+app.use('/api', (err, _req, res, _next) => {
+  if (err && (err.type === 'entity.too.large' || err.statusCode === 413 || err.status === 413)) {
+    return res.status(413).json({ ok: false, error: 'Payload too large (8MB max).' });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ ok: false, error: 'Invalid JSON body.' });
+  }
+  console.error('API error:', err && err.message);
+  res.status(500).json({ ok: false, error: 'Request failed.' });
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -330,6 +672,9 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+loadState();
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`A-Chat listening on http://0.0.0.0:${PORT}`);
