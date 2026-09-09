@@ -6,6 +6,7 @@
 
 const $ = (id) => document.getElementById(id);
 
+const authScreen = $('authScreen');
 const joinScreen = $('joinScreen');
 const app = $('app');
 const nameInput = $('nameInput');
@@ -29,6 +30,8 @@ const themeBtn = $('themeBtn');
 const logoutBtn = $('logoutBtn');
 const backBtn = $('backBtn');
 const newGroupBtn = $('newGroupBtn');
+const newRoomBtn = $('newRoomBtn');
+const joinRoomBtn = $('joinRoomBtn');
 const myAvatarWrap = $('myAvatarWrap');
 const toastEl = $('toast');
 
@@ -39,8 +42,12 @@ const state = {
   ws: null,
   connected: false,
   recording: false,
+  authenticated: false,
+  authToken: null,
+  authUsername: null,
   users: [],            // [{name, online, bot, lastSeen, pic, about}]
   groups: new Map(),    // grp::<id> -> group
+  rooms: new Map(),     // room::<id> -> room
   chats: new Map(),     // convoId -> {messages: [], unread: 0, lastTs: 0}
   active: null,         // active convoId
   lastDateLabel: null,
@@ -159,6 +166,11 @@ function metaFor(convoId) {
     if (!g) return null;
     return { kind: 'group', members: [...g.members], title: g.name, pic: g.pic, group: g };
   }
+  if (convoId.startsWith('room::')) {
+    const r = state.rooms.get(convoId);
+    if (!r) return null;
+    return { kind: 'room', members: [...r.members], title: r.name, pic: null, room: r };
+  }
   return null;
 }
 
@@ -188,7 +200,10 @@ function connect() {
   state.ws.onopen = () => {
     state.connected = true;
     setConnUI();
-    if (state.me) wsSend({ type: 'join', name: state.me });
+    // If we already have auth, re-join
+    if (state.authenticated && state.authUsername && state.authToken) {
+      wsSend({ type: 'join', name: state.authUsername, token: state.authToken });
+    }
   };
   state.ws.onmessage = (e) => {
     try { handle(JSON.parse(e.data)); } catch (err) { console.error(err); }
@@ -206,12 +221,62 @@ function setConnUI() {
   connBanner.classList.toggle('hidden', state.connected || !joined);
 }
 
-/* ------------------------------ join flow ---------------------------------- */
+/* ------------------------------ auth flow ---------------------------------- */
+
+const authUsernameInput = $('authUsername');
+const authPasswordInput = $('authPassword');
+const authSubmitBtn = $('authSubmitBtn');
+const authErrorEl = $('authError');
+let authMode = 'login'; // 'login' or 'register'
+
+// Tab switching
+document.querySelectorAll('.auth-tab').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    authMode = tab.dataset.tab;
+    document.querySelectorAll('.auth-tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === authMode));
+    authSubmitBtn.textContent = authMode === 'login' ? 'Log in' : 'Create account';
+    authPasswordInput.autocomplete = authMode === 'login' ? 'current-password' : 'new-password';
+    authErrorEl.classList.add('hidden');
+  });
+});
+
+authSubmitBtn.addEventListener('click', submitAuth);
+authPasswordInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
+authUsernameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') authPasswordInput.focus(); });
+
+function submitAuth() {
+  const username = authUsernameInput.value.trim();
+  const password = authPasswordInput.value;
+  if (!username || username.length < 2) {
+    authErrorEl.textContent = 'Username must be at least 2 characters.';
+    authErrorEl.classList.remove('hidden');
+    return;
+  }
+  if (!password || password.length < 3) {
+    authErrorEl.textContent = 'Password must be at least 3 characters.';
+    authErrorEl.classList.remove('hidden');
+    return;
+  }
+  authErrorEl.classList.add('hidden');
+  authSubmitBtn.disabled = true;
+  if (authMode === 'register') {
+    wsSend({ type: 'register', username, password });
+  } else {
+    wsSend({ type: 'login', username, password });
+  }
+  setTimeout(() => { authSubmitBtn.disabled = false; }, 3000);
+}
+
+// Check for stored session token on load
+const storedToken = localStorage.getItem('achat-token');
+const storedName = localStorage.getItem('achat-name');
+
+/* ------------------------------ join flow (legacy/fallback) ---------------------------------- */
 
 joinBtn.addEventListener('click', startJoin);
 nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') startJoin(); });
 
-nameInput.value = localStorage.getItem('achat-name') || '';
+nameInput.value = storedName || '';
 nameInput.focus();
 
 function startJoin() {
@@ -227,10 +292,72 @@ function startJoin() {
 
 function handle(msg) {
   switch (msg.type) {
+    case 'auth_ok': {
+      state.authenticated = true;
+      state.authToken = msg.token;
+      state.authUsername = msg.username;
+      localStorage.setItem('achat-token', msg.token);
+      localStorage.setItem('achat-name', msg.username);
+      authScreen.classList.add('hidden');
+      // Auto-join with authenticated name
+      state.me = msg.username;
+      if (state.connected) wsSend({ type: 'join', name: msg.username, token: msg.token });
+      break;
+    }
+
+    case 'auth_error': {
+      const errEl = $('authError');
+      errEl.textContent = msg.error || 'Authentication failed';
+      errEl.classList.remove('hidden');
+      break;
+    }
+
+    case 'rooms': {
+      state.rooms = new Map((msg.rooms || []).map((r) => [r.id, r]));
+      renderChatList();
+      updateActiveHeader();
+      break;
+    }
+
+    case 'room_created': {
+      state.rooms.set(msg.room.id, msg.room);
+      closeRoomModal();
+      showInviteCard(msg.room);
+      renderChatList();
+      break;
+    }
+
+    case 'room_joined': {
+      state.rooms.set(msg.room.id, msg.room);
+      closeJoinRoomModal();
+      toast(`Joined room "${msg.room.name}" 🔒`);
+      renderChatList();
+      openChat(msg.room.id);
+      break;
+    }
+
+    case 'room_member_joined': {
+      const room = state.rooms.get(msg.roomId);
+      if (room && !room.members.includes(msg.member)) {
+        room.members.push(msg.member);
+      }
+      if (state.active === msg.roomId) {
+        // Show notice in chat
+        const notice = document.createElement('div');
+        notice.className = 'room-notice';
+        notice.innerHTML = `<span>🔒 ${msg.member} joined the room</span>`;
+        messagesEl.appendChild(notice);
+        scrollBottom();
+        updateActiveHeader();
+      }
+      break;
+    }
+
     case 'joined': {
       state.me = msg.name;
       state.users = msg.users || [];
       state.groups = new Map((msg.groups || []).map((g) => [g.id, g]));
+      state.rooms = new Map((msg.rooms || []).map((r) => [r.id, r]));
       joinScreen.classList.add('hidden');
       app.classList.remove('hidden');
       renderMe();
@@ -345,6 +472,19 @@ function handle(msg) {
       joinScreen.classList.remove('hidden');
       break;
     }
+
+    case 'reaction': {
+      const chat = getChat(msg.convoId);
+      const m = chat.messages.find((x) => x.id === msg.id);
+      if (m) {
+        m.reactions = msg.reactions || {};
+        if (state.active === msg.convoId) {
+          renderReactionsOnBubble(m);
+        }
+        renderChatList();
+      }
+      break;
+    }
   }
 }
 
@@ -360,10 +500,13 @@ function listEntries() {
   for (const u of state.users) {
     if (u.name === state.me) continue;
     const id = dmConvoId(state.me, u.name);
-    entries.push({ id, title: u.name, pic: u.pic, user: u, chat: getChat(id) });
+    entries.push({ id, title: u.name, pic: u.pic, user: u, chat: getChat(id), kind: 'dm' });
   }
   for (const g of state.groups.values()) {
-    entries.push({ id: g.id, title: g.name, pic: g.pic, group: g, chat: getChat(g.id) });
+    entries.push({ id: g.id, title: g.name, pic: g.pic, group: g, chat: getChat(g.id), kind: 'group' });
+  }
+  for (const r of state.rooms.values()) {
+    entries.push({ id: r.id, title: r.name, pic: null, room: r, chat: getChat(r.id), kind: 'room' });
   }
   return entries.sort((a, b) => (b.chat.lastTs - a.chat.lastTs) || a.title.localeCompare(b.title));
 }
@@ -383,13 +526,14 @@ function renderChatList() {
     if (filter && !c.title.toLowerCase().includes(filter)) continue;
     any = true;
     const isGroup = !!c.group;
+    const isRoom = !!c.room;
     const item = document.createElement('div');
     item.className = 'chat-item' + (c.id === state.active ? ' active' : '');
     item.addEventListener('click', () => openChat(c.id));
 
     const av = document.createElement('div');
     av.className = 'avatar';
-    applyAvatar(av, c.title, c.pic, isGroup ? '👥' : undefined);
+    applyAvatar(av, c.title, c.pic, isGroup ? '👥' : isRoom ? '🔒' : undefined);
 
     const body = document.createElement('div');
     body.className = 'ci-body';
@@ -403,6 +547,14 @@ function renderChatList() {
       const tag = document.createElement('span');
       tag.className = 'bot-tag';
       tag.textContent = 'BOT';
+      nameEl.appendChild(tag);
+    }
+    if (isRoom) {
+      const tag = document.createElement('span');
+      tag.className = 'bot-tag';
+      tag.style.borderColor = '#e67e22';
+      tag.style.color = '#e67e22';
+      tag.textContent = '🔒';
       nameEl.appendChild(tag);
     }
     const timeEl = document.createElement('span');
@@ -432,6 +584,8 @@ function renderChatList() {
       prev.appendChild(txt);
     } else if (isGroup) {
       prev.textContent = `${c.group.members.length} members`;
+    } else if (isRoom) {
+      prev.textContent = `${c.room.members.length} members • invite: ${c.room.inviteCode}`;
     } else {
       prev.textContent = c.user && c.user.online ? (c.user.bot ? 'bot • online' : 'online') : 'tap to start chatting';
     }
@@ -467,7 +621,7 @@ function openChat(convoId) {
   document.body.classList.add('chat-open');
 
   chatTitle.textContent = meta.title;
-  applyAvatar(chatAvatar, meta.group ? meta.group.id : meta.title, meta.pic, meta.kind === 'group' ? '👥' : undefined);
+  applyAvatar(chatAvatar, meta.group ? meta.group.id : meta.title, meta.pic, meta.kind === 'group' ? '👥' : meta.kind === 'room' ? '🔒' : undefined);
   updateActiveHeader();
 
   const chat = getChat(convoId);
@@ -496,6 +650,12 @@ function updateActiveHeader() {
     const others = meta.members.filter((n) => n !== state.me);
     chatStatus.className = 'chat-status';
     chatStatus.textContent = others.length ? others.join(', ') : 'just you';
+  } else if (meta.kind === 'room') {
+    if (chatStatus.dataset.typing === '1') return;
+    const others = meta.members.filter((n) => n !== state.me);
+    const onlineCount = others.filter((n) => { const u = findUser(n); return u && u.online; }).length;
+    chatStatus.className = 'chat-status';
+    chatStatus.textContent = `${meta.members.length} members` + (onlineCount ? ` • ${onlineCount} online` : '') + ` • 🔒 invite: ${meta.room.inviteCode}`;
   } else {
     const u = meta.user;
     if (!u) { chatStatus.textContent = ''; return; }
@@ -684,8 +844,160 @@ function buildBubble(m, prev) {
     }
   }
 
-  row.appendChild(bubble);
+  // Wrapper to stack bubble + reactions vertically
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-wrap';
+  wrap.appendChild(bubble);
+
+  const reactionsEl = document.createElement('div');
+  reactionsEl.className = 'reactions-row';
+  wrap.appendChild(reactionsEl);
+  renderReactionsInEl(m, reactionsEl);
+
+  row.appendChild(wrap);
+  row.dataset.msgId = m.id;
+
+  // Long-press / right-click to open reaction picker
+  let pressTimer = null;
+  const openPicker = (e) => {
+    if (e) e.preventDefault();
+    openReactionPicker(m, reactionsEl);
+  };
+  row.addEventListener('contextmenu', (e) => { e.preventDefault(); openPicker(e); });
+  row.addEventListener('pointerdown', () => {
+    pressTimer = setTimeout(openPicker, 500);
+  });
+  row.addEventListener('pointerup', () => clearTimeout(pressTimer));
+  row.addEventListener('pointerleave', () => clearTimeout(pressTimer));
+
   return row;
+}
+
+/* ---- reactions ---- */
+
+const QUICK_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
+
+function renderReactionsInEl(m, container) {
+  const reactions = m.reactions || {};
+  const keys = Object.keys(reactions).filter((k) => reactions[k] && reactions[k].length);
+  container.innerHTML = '';
+  for (const emoji of keys) {
+    const users = reactions[emoji];
+    const chip = document.createElement('button');
+    chip.className = 'reaction-chip';
+    if (users.includes(state.me)) chip.classList.add('mine');
+    chip.innerHTML = `<span class="reaction-emoji">${emoji}</span><span class="reaction-count">${users.length}</span>`;
+    chip.title = users.join(', ');
+    chip.addEventListener('click', () => {
+      const add = !users.includes(state.me);
+      wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add });
+    });
+    container.appendChild(chip);
+  }
+  // add "+" button to add more reactions
+  const addBtn = document.createElement('button');
+  addBtn.className = 'reaction-add';
+  addBtn.innerHTML = '+';
+  addBtn.title = 'Add reaction';
+  addBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openReactionPicker(m, container);
+  });
+  container.appendChild(addBtn);
+}
+
+function renderReactionsOnBubble(m) {
+  const row = messagesEl.querySelector(`[data-msg-id="${m.id}"]`);
+  if (!row) return;
+  const container = row.querySelector('.reactions-row');
+  if (container) renderReactionsInEl(m, container);
+}
+
+let reactionPickerEl = null;
+function openReactionPicker(m, anchorEl) {
+  closeReactionPicker();
+  const picker = document.createElement('div');
+  picker.className = 'reaction-picker';
+  picker.id = 'reactionPicker';
+  for (const emoji of QUICK_REACTIONS) {
+    const btn = document.createElement('button');
+    btn.className = 'reaction-pick';
+    btn.textContent = emoji;
+    btn.addEventListener('click', () => {
+      wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add: true });
+      closeReactionPicker();
+    });
+    picker.appendChild(btn);
+  }
+  // Add a "more" button that opens a larger grid
+  const moreBtn = document.createElement('button');
+  moreBtn.className = 'reaction-pick reaction-more-pick';
+  moreBtn.textContent = '⋯';
+  moreBtn.title = 'More reactions';
+  moreBtn.addEventListener('click', () => {
+    picker.innerHTML = '';
+    const ALL_REACTIONS = ['❤️','👍','😂','😮','😢','🙏','🔥','🎉','😍','👎','💯','🤣','😡','🥺','✨','👏','🤝','💪','🫶','💔'];
+    for (const emoji of ALL_REACTIONS) {
+      const btn = document.createElement('button');
+      btn.className = 'reaction-pick';
+      btn.textContent = emoji;
+      btn.addEventListener('click', () => {
+        wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji, add: true });
+        closeReactionPicker();
+      });
+      picker.appendChild(btn);
+    }
+    const backBtn = document.createElement('button');
+    backBtn.className = 'reaction-pick reaction-back';
+    backBtn.textContent = '←';
+    backBtn.addEventListener('click', () => {
+      picker.innerHTML = '';
+      for (const e of QUICK_REACTIONS) {
+        const b = document.createElement('button');
+        b.className = 'reaction-pick';
+        b.textContent = e;
+        b.addEventListener('click', () => {
+          wsSend({ type: 'react', convoId: m.convoId, id: m.id, emoji: e, add: true });
+          closeReactionPicker();
+        });
+        picker.appendChild(b);
+      }
+      const mb = document.createElement('button');
+      mb.className = 'reaction-pick reaction-more-pick';
+      mb.textContent = '⋯';
+      mb.addEventListener('click', moreBtn.click.bind(moreBtn));
+      picker.appendChild(mb);
+    });
+    picker.appendChild(backBtn);
+  });
+  picker.appendChild(moreBtn);
+
+  document.body.appendChild(picker);
+  reactionPickerEl = picker;
+
+  // Position near the message row
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.position = 'fixed';
+  picker.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  picker.style.left = Math.min(rect.left, window.innerWidth - 260) + 'px';
+
+  // Close on outside click
+  setTimeout(() => {
+    const closer = (e) => {
+      if (!picker.contains(e.target)) {
+        closeReactionPicker();
+        document.removeEventListener('pointerdown', closer);
+      }
+    };
+    document.addEventListener('pointerdown', closer);
+  }, 50);
+}
+
+function closeReactionPicker() {
+  if (reactionPickerEl && reactionPickerEl.parentNode) {
+    reactionPickerEl.parentNode.removeChild(reactionPickerEl);
+  }
+  reactionPickerEl = null;
 }
 
 function renderMessages(chat) {
@@ -1238,17 +1550,6 @@ logoutBtn.addEventListener('click', () => {
 
 backBtn.addEventListener('click', () => document.body.classList.remove('chat-open'));
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    if (!lightbox.classList.contains('hidden')) {
-      lightbox.classList.add('hidden');
-      lightboxImg.src = '';
-    }
-    closePhotoModal();
-    closeGroupModal();
-  }
-});
-
 /* ------------------------------ misc --------------------------------------- */
 
 function updateTitleBadge() {
@@ -1268,5 +1569,168 @@ window.addEventListener('focus', () => {
     wsSend({ type: 'read', convoId: state.active });
   }
 });
+
+/* ------------------------------ room modals ------------------------------ */
+
+const roomModal = $('roomModal');
+const roomCloseBtn = $('roomCloseBtn');
+const roomCancelBtn = $('roomCancelBtn');
+const roomCreateBtn = $('roomCreateBtn');
+const roomNameInput = $('roomNameInput');
+const roomPasswordInput = $('roomPasswordInput');
+
+const joinRoomModal = $('joinRoomModal');
+const joinRoomCloseBtn = $('joinRoomCloseBtn');
+const joinRoomCancelBtn = $('joinRoomCancelBtn');
+const joinRoomSubmitBtn = $('joinRoomSubmitBtn');
+const joinRoomCodeInput = $('joinRoomCodeInput');
+const joinRoomPasswordInput = $('joinRoomPasswordInput');
+const joinRoomErrorEl = $('joinRoomError');
+
+const roomInviteModal = $('roomInviteModal');
+const inviteCloseBtn = $('inviteCloseBtn');
+const inviteDoneBtn = $('inviteDoneBtn');
+const inviteCodeDisplay = $('inviteCodeDisplay');
+const inviteRoomName = $('inviteRoomName');
+const copyInviteBtn = $('copyInviteBtn');
+
+newRoomBtn.addEventListener('click', openRoomModal);
+roomCloseBtn.addEventListener('click', closeRoomModal);
+roomCancelBtn.addEventListener('click', closeRoomModal);
+
+function openRoomModal() {
+  roomNameInput.value = '';
+  roomPasswordInput.value = '';
+  roomCreateBtn.disabled = false;
+  roomModal.classList.remove('hidden');
+  roomNameInput.focus();
+}
+
+function closeRoomModal() {
+  roomModal.classList.add('hidden');
+  roomCreateBtn.disabled = false;
+}
+
+roomCreateBtn.addEventListener('click', () => {
+  const name = roomNameInput.value.trim();
+  const password = roomPasswordInput.value;
+  if (!name) { toast('Please enter a room name'); roomNameInput.focus(); return; }
+  if (!password || password.length < 3) { toast('Password must be at least 3 characters'); roomPasswordInput.focus(); return; }
+  roomCreateBtn.disabled = true;
+  wsSend({ type: 'room_create', name, password });
+  setTimeout(() => { roomCreateBtn.disabled = false; }, 3000);
+});
+
+// Join room
+joinRoomBtn.addEventListener('click', openJoinRoomModal);
+joinRoomCloseBtn.addEventListener('click', closeJoinRoomModal);
+joinRoomCancelBtn.addEventListener('click', closeJoinRoomModal);
+
+function openJoinRoomModal() {
+  joinRoomCodeInput.value = '';
+  joinRoomPasswordInput.value = '';
+  joinRoomErrorEl.classList.add('hidden');
+  joinRoomSubmitBtn.disabled = false;
+  joinRoomModal.classList.remove('hidden');
+  joinRoomCodeInput.focus();
+}
+
+function closeJoinRoomModal() {
+  joinRoomModal.classList.add('hidden');
+  joinRoomSubmitBtn.disabled = false;
+}
+
+joinRoomSubmitBtn.addEventListener('click', () => {
+  const code = joinRoomCodeInput.value.trim().toUpperCase();
+  const password = joinRoomPasswordInput.value;
+  if (!code && !password) {
+    joinRoomErrorEl.textContent = 'Enter an invite code or room password.';
+    joinRoomErrorEl.classList.remove('hidden');
+    return;
+  }
+  joinRoomErrorEl.classList.add('hidden');
+  joinRoomSubmitBtn.disabled = true;
+  // If we have a code, try joining by code first
+  if (code) {
+    wsSend({ type: 'room_join', roomId: '', inviteCode: code, password: '' });
+  } else {
+    // Need to find room by password — send all rooms we know about
+    // Actually the server needs a roomId. Let's send password and let server match.
+    // For simplicity, we'll try joining each known room with this password.
+    // Better: send a special "join by password" request.
+    // For now, iterate through known rooms
+    let found = false;
+    for (const r of state.rooms.values()) {
+      if (r.members.includes(state.me)) continue;
+      wsSend({ type: 'room_join', roomId: r.id, password, inviteCode: '' });
+      found = true;
+      break;
+    }
+    if (!found) {
+      joinRoomErrorEl.textContent = 'No rooms available. Ask for an invite code.';
+      joinRoomErrorEl.classList.remove('hidden');
+      joinRoomSubmitBtn.disabled = false;
+    }
+  }
+  setTimeout(() => { joinRoomSubmitBtn.disabled = false; }, 3000);
+});
+
+// Invite card
+function showInviteCard(room) {
+  inviteRoomName.textContent = room.name;
+  inviteCodeDisplay.textContent = room.inviteCode;
+  roomInviteModal.classList.remove('hidden');
+}
+
+function closeInviteModal() {
+  roomInviteModal.classList.add('hidden');
+}
+inviteCloseBtn.addEventListener('click', closeInviteModal);
+inviteDoneBtn.addEventListener('click', closeInviteModal);
+
+copyInviteBtn.addEventListener('click', async () => {
+  const code = inviteCodeDisplay.textContent;
+  try {
+    await navigator.clipboard.writeText(code);
+    toast('Invite code copied! 📋');
+  } catch {
+    // Fallback: select the text
+    const range = document.createRange();
+    range.selectNode(inviteCodeDisplay);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    toast('Select and copy the code above');
+  }
+});
+
+/* ------------------------------ escape key updates ------------------------------ */
+
+// Update existing escape handler
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (!lightbox.classList.contains('hidden')) {
+      lightbox.classList.add('hidden');
+      lightboxImg.src = '';
+    }
+    closePhotoModal();
+    closeGroupModal();
+    closeRoomModal();
+    closeJoinRoomModal();
+    closeInviteModal();
+    closeReactionPicker();
+  }
+});
+
+/* ------------------------------ initial screen ------------------------------ */
+
+// Show auth screen by default (unless we have a stored token)
+if (storedToken && storedName) {
+  authScreen.classList.add('hidden');
+  // Will auto-auth via connect() onopen
+} else {
+  authScreen.classList.remove('hidden');
+  authUsernameInput.value = storedName || '';
+  authUsernameInput.focus();
+}
 
 connect();

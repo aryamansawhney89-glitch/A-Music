@@ -5,8 +5,11 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 
 ## Features
 
+- **User accounts 🔐** — register with a username and password; login is required; sessions persist in localStorage so you don't have to re-auth on refresh
 - **Realtime messaging** between browser tabs / devices over WebSocket
 - **WhatsApp Web UI** — chat list, message bubbles with tails, date separators, ✓ / ✓✓ / blue-tick receipts
+- **Password-protected rooms 🔒** — create a room with a name and password; join with the password or a 6-character invite code; share invite codes with others
+- **Message reactions 😍** — long-press (or right-click) any message to react with emoji; bots also react to your messages; click a reaction chip to toggle yours
 - **Group chats 👥** — "New group" modal with name, optional group picture and member
   checkboxes; group messages show colored sender names; delivery/read ticks aggregate
   across all members
@@ -29,9 +32,9 @@ vanilla HTML/CSS/JS frontend that mirrors the WhatsApp Web experience.
 - **Conversation-based server routing** — every message belongs to a `convoId`
   (`dm::A::B` for direct messages, `grp::<id>` for groups), so both kinds share one
   code path for history, receipts and typing
-- **Chat history, groups and profiles persisted** to `data/messages.json`,
-  `data/groups.json` and `data/users.json` (survive server restarts; legacy
-  message stores are migrated automatically)
+- **Chat history, groups, rooms and profiles persisted** to `data/messages.json`,
+  `data/groups.json`, `data/rooms.json`, `data/accounts.json` and `data/users.json`
+  (survive server restarts; legacy message stores are migrated automatically)
 - **Upload API** — `POST /api/upload` accepts base64 data URLs (images + audio,
   8 MB cap) and returns a `/uploads/...` URL
 
@@ -76,11 +79,12 @@ Start `npm start`, Plan **Free** → **Deploy**.
 ## How it works
 
 - `server.js` — Express static host + `ws` WebSocket router + `/api/upload`. Every
-  message carries a `convoId`: `dm::A::B` (two participants) or `grp::<id>` (group).
-  Presence, typing and per-member delivered/read receipts (`deliveredBy` / `readBy`
-  arrays) travel as JSON frames; history, groups and profiles are kept in memory and
-  flushed to `data/messages.json`, `data/groups.json` and `data/users.json`.
-  Uploaded media is written to `data/uploads` and served at `/uploads`.
+  message carries a `convoId`: `dm::A::B` (two participants), `grp::<id>` (group), or
+  `room::<id>` (password-protected room). Presence, typing and per-member delivered/read
+  receipts (`deliveredBy` / `readBy` arrays) travel as JSON frames; history, groups,
+  profiles, reactions, accounts and rooms are kept in memory and flushed to JSON files
+  in `data/`. Passwords are hashed with PBKDF2 (10,000 iterations, SHA-512). Uploaded
+  media is written to `data/uploads` and served at `/uploads`.
 - `public/` — zero-build frontend (`index.html`, `style.css`, `app.js`) plus
   `public/avatars/*.svg` for the bot profile pictures.
 - The client talks to the server over the same host/port (`ws://`/`wss://`), so it

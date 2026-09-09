@@ -10,15 +10,35 @@
 <body>
   <div class="top-strip"></div>
 
-  <!-- Join screen -->
-  <div id="joinScreen" class="join-screen">
+  <!-- Auth screen (login / register) -->
+  <div id="authScreen" class="join-screen">
+    <div class="join-card auth-card">
+      <div class="join-logo">💬</div>
+      <h1>A-Chat</h1>
+      <p class="join-sub">Sign in or create an account</p>
+      <div class="auth-tabs">
+        <button class="auth-tab active" data-tab="login">Log in</button>
+        <button class="auth-tab" data-tab="register">Register</button>
+      </div>
+      <div id="authForm">
+        <input id="authUsername" maxlength="24" placeholder="Username" autocomplete="username" />
+        <input id="authPassword" type="password" maxlength="64" placeholder="Password" autocomplete="current-password" />
+        <p id="authError" class="auth-error hidden"></p>
+        <button id="authSubmitBtn">Log in</button>
+      </div>
+      <p class="join-hint">Your account is stored on this server. Create one to get started!</p>
+    </div>
+  </div>
+
+  <!-- Join screen (after auth, pick display name if needed) -->
+  <div id="joinScreen" class="join-screen hidden">
     <div class="join-card">
       <div class="join-logo">💬</div>
       <h1>A-Chat</h1>
       <p class="join-sub">Real-time messaging, WhatsApp style.</p>
       <input id="nameInput" maxlength="24" placeholder="Enter your name" autocomplete="off" />
       <button id="joinBtn">Start chatting</button>
-      <p class="join-hint">Tip: open this page in a second tab and join with a different name to chat live between users — or create a group with the 👥 button in the sidebar.</p>
+      <p class="join-hint">Tip: open this page in a second tab and join with a different name to chat live between users — or create a group with the 👥 button or a room with the 🔒 button.</p>
     </div>
   </div>
 
@@ -32,6 +52,8 @@
         <div class="me-name" id="myName"></div>
         <div class="side-actions">
           <button id="newGroupBtn" class="icon-btn" title="New group">👥</button>
+          <button id="newRoomBtn" class="icon-btn" title="New room">🔒</button>
+          <button id="joinRoomBtn" class="icon-btn" title="Join room">🚪</button>
           <button id="themeBtn" class="icon-btn" title="Toggle dark mode">🌙</button>
           <button id="logoutBtn" class="icon-btn" title="Log out">⏻</button>
         </div>
@@ -113,6 +135,60 @@
       <footer>
         <button id="groupCancelBtn" class="btn">Cancel</button>
         <button id="groupCreateBtn" class="btn primary">Create group</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- New room modal -->
+  <div id="roomModal" class="modal-overlay hidden">
+    <div class="modal room-modal">
+      <header><span>New password-protected room</span><button id="roomCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <label class="rm-label">Room name</label>
+        <input id="roomNameInput" maxlength="50" placeholder="e.g. Secret Club" autocomplete="off" />
+        <label class="rm-label">Password</label>
+        <input id="roomPasswordInput" type="password" maxlength="64" placeholder="Set a password for this room" />
+        <p class="rm-hint">Anyone with the password or an invite code can join and chat.</p>
+      </div>
+      <footer>
+        <button id="roomCancelBtn" class="btn">Cancel</button>
+        <button id="roomCreateBtn" class="btn primary">Create room</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Join room modal -->
+  <div id="joinRoomModal" class="modal-overlay hidden">
+    <div class="modal join-room-modal">
+      <header><span>Join a room</span><button id="joinRoomCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body">
+        <label class="rm-label">Invite code <span class="rm-or">(or use password below)</span></label>
+        <input id="joinRoomCodeInput" maxlength="6" placeholder="e.g. A1B2C3" autocomplete="off" style="text-transform: uppercase" />
+        <div class="rm-divider"><span>OR</span></div>
+        <label class="rm-label">Room password</label>
+        <input id="joinRoomPasswordInput" type="password" maxlength="64" placeholder="Enter room password" />
+        <p id="joinRoomError" class="auth-error hidden"></p>
+      </div>
+      <footer>
+        <button id="joinRoomCancelBtn" class="btn">Cancel</button>
+        <button id="joinRoomSubmitBtn" class="btn primary">Join room</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Room invite card (shown after room creation) -->
+  <div id="roomInviteModal" class="modal-overlay hidden">
+    <div class="modal invite-modal">
+      <header><span>🔒 Room created!</span><button id="inviteCloseBtn" class="icon-btn" title="Close">✕</button></header>
+      <div class="modal-body" style="text-align:center">
+        <p class="invite-room-name" id="inviteRoomName"></p>
+        <p class="invite-label">Share this invite code:</p>
+        <div class="invite-code" id="inviteCodeDisplay"></div>
+        <button id="copyInviteBtn" class="btn primary" style="margin-top:12px">📋 Copy code</button>
+        <p class="invite-hint">Anyone with this code can join the room.</p>
+      </div>
+      <footer>
+        <button id="inviteDoneBtn" class="btn primary">Done</button>
       </footer>
     </div>
   </div>
